@@ -1,0 +1,1089 @@
+---
+output:
+  md_document:
+    variant: markdown_github
+    
+title: "Question 2"
+subtitle: "Size Matters? Risk and Return Traits of South African Large, Mid and Small Cap Indexes"
+documentclass: "elsarticle"
+Thesis_FP: FALSE
+AddTitle: TRUE
+Author1: "Happy Matope"
+Ref1: "Stellenbosch University, South Africa"
+Email1: "25098209\\@sun.ac.za"
+keywords: "Size indexes \\sep Active share \\sep Realised volatility \\sep GJR-GARCH \\sep Stratification"
+JELCodes: "G11 \\sep G12 \\sep C58"
+BottomRFooter: "\\footnotesize Page \\thepage"
+addtoprule: TRUE
+addfootrule: TRUE
+margin: 2.3
+bottom: 2
+top: 2.5
+HardSet_layout: TRUE
+linenumbers: FALSE
+bibliography: Tex/ref.bib
+csl: Tex/harvard-stellenbosch-university.csl
+RemovePreprintSubmittedTo: TRUE
+toc: FALSE
+numbersections: TRUE
+fontsize: 11pt
+linestretch: 1.2
+link-citations: TRUE
+output:
+  pdf_document:
+    keep_tex: TRUE
+    template: Tex/TexDefault.txt
+    fig_width: 3.5
+    fig_height: 3.5
+
+---
+
+
+```{r}
+
+rm(list = ls()) # Clean your environment:
+gc() # garbage collection - It can be useful to call gc after a large object has been removed, as this may prompt R to return memory to the operating system.
+library(tidyverse)
+list.files('code/', full.names = T, recursive = T) %>% .[grepl('.R', .)] %>% as.list() %>% walk(~source(.))
+```
+
+```{r packages, include=FALSE}
+pacman::p_load(tidyverse, lubridate, tbl2xts, PerformanceAnalytics, RcppRoll,
+               rmsfuns, fmxdat, xts, rugarch, xtable)
+
+# Helper for LaTeX tables (Texevier convention: xtable + results = 'asis')
+tab_print <- function(df, caption, label, digits = 3, size = "\\footnotesize") {
+  print(xtable::xtable(df, caption = caption, label = label, digits = digits),
+        include.rownames = FALSE, comment = FALSE,
+        table.placement = "!htbp", caption.placement = "top", size = size)
+}
+```
+
+# Introduction \label{Introduction}
+
+Size indexes are often treated as interchangeable slices of the same market. They are not. A large-cap index can carry a different sector bet, a different degree of concentration and a different response to market stress than a mid- or small-cap index. For a manager benchmarked to the Capped SWIX (J433), these differences determine whether a size tilt adds diversification or simply re-labels the same risk.
+
+This report studies the JSE Large, Mid and Small cap indexes from January 2015 to September 2026. It asks four questions:
+
+1. How do the indexes differ in sector exposure and stock concentration?
+2. How far does each index sit from the Capped SWIX, measured by active share?
+3. How do their returns and realised volatility compare, at index and constituent level?
+4. Does the ranking of the size indexes change in stressed versus calm months?
+
+The analysis uses stratification, realised and GARCH volatility, rolling returns and active share. Section \ref{Data} describes the data, Section \ref{Method} the methods, Section \ref{Results} the results, and Section \ref{Summary} summarises.
+
+# Data \label{Data}
+
+```{r load-data, include=FALSE}
+# -------------------------------------------------------------------
+# Load data
+# -------------------------------------------------------------------
+Size_Idx  <- read_rds("data/Monthly_Index_Constituents.rds")
+Stocks    <- read_rds("data/Stock_Returns_Daily.rds")
+Idx_Daily <- read_rds("data/Index_Returns_Daily.rds")
+Implied   <- read_rds("data/Implied_Vol_Indexes.rds")
+Uncert    <- read_rds("data/Econ_Uncertainty_Indexes.rds")
+LCL_Cncy  <- read_rds("data/LCL_Currency_Vol_Index.rds")
+Commods   <- read_rds("data/Commodities.rds")
+
+# Stock returns start 2015-01-02, so use holdings from end-Dec 2014.
+Size_Idx <- Size_Idx %>% filter(date >= ymd(20141231))
+
+# -------------------------------------------------------------------
+# Sector map: sector is missing for many (mostly small-cap) rows. Use a
+# stock's sector from any other row where it is recorded; otherwise
+# label it "Unclassified".
+# -------------------------------------------------------------------
+Sector_Map <-
+  Size_Idx %>%
+  filter(!is.na(Sector)) %>%
+  arrange(date) %>%
+  group_by(Tickers) %>%
+  summarise(Sector_Fill = dplyr::last(Sector))
+
+Size_Idx <-
+  Size_Idx %>%
+  left_join(Sector_Map, by = "Tickers") %>%
+  mutate(Sector = coalesce(Sector, Sector_Fill, "Unclassified")) %>%
+  select(-Sector_Fill)
+
+# -------------------------------------------------------------------
+# Re-scale weights so each index sums to 1 every month (Bonus 1)
+# -------------------------------------------------------------------
+W_df <-
+  Size_Idx %>%
+  group_by(Fund, date) %>%
+  mutate(weight = Weight / sum(Weight)) %>%
+  ungroup()
+
+if (W_df %>% group_by(Fund, date) %>% summarise(s = sum(weight), .groups = "drop") %>%
+    filter(abs(s - 1) > 1e-6) %>% nrow() > 0) stop("Weights do not sum to 1")
+```
+
+```{r rebuild, include=FALSE}
+# -------------------------------------------------------------------
+# Rebuild daily index returns from holdings
+# (Practical 1: rmsfuns::Safe_Return.portfolio, weights as xts)
+# -------------------------------------------------------------------
+Index_Builder <- function(Fund_Name) {
+
+  W_xts <- W_df %>% filter(Fund == Fund_Name) %>%
+    tbl_xts(cols_to_xts = weight, spread_by = Tickers)
+
+  R_xts <- Stocks %>% filter(Tickers %in% names(W_xts)) %>%
+    tbl_xts(cols_to_xts = Returns, spread_by = Tickers)
+
+  # A few holdings have no return data: drop them and re-weight to 1
+  W_xts <- W_xts[, names(W_xts) %in% names(R_xts)]
+  W_xts[is.na(W_xts)] <- 0
+  W_xts <- W_xts / rowSums(W_xts)
+
+  R_xts <- R_xts[, names(W_xts)]
+  R_xts[is.na(R_xts)] <- 0
+
+  rmsfuns::Safe_Return.portfolio(R = R_xts, weights = W_xts,
+                                 lag_weights = TRUE, geometric = TRUE) %>%
+    xts_tbl() %>%
+    rename(Returns = portfolio.returns) %>%
+    mutate(Tickers = Fund_Name)
+}
+
+Rebuilt <- map_df(c("LargeCaps", "MidCaps", "SmallCaps", "CappedSWIX"),
+                  Index_Builder)
+
+# Daily log returns used for volatility work throughout
+Daily <- Rebuilt %>% mutate(dlogret = log(1 + Returns))
+
+# -------------------------------------------------------------------
+# Validation: rebuilt vs official index series
+# -------------------------------------------------------------------
+Official <-
+  Idx_Daily %>%
+  filter(Tickers %in% c("J200", "J201", "J202", "J433")) %>%
+  mutate(Tickers = recode(Tickers, J200 = "LargeCaps", J201 = "MidCaps",
+                          J202 = "SmallCaps", J433 = "CappedSWIX")) %>%
+  select(date, Tickers, Official = Returns)
+
+Validation <-
+  Rebuilt %>%
+  inner_join(Official, by = c("date", "Tickers")) %>%
+  group_by(Tickers) %>%
+  summarise(Correlation = cor(Returns, Official),
+            Ann_Ret_Rebuilt  = prod(1 + Returns)^(252 / n()) - 1,
+            Ann_Ret_Official = prod(1 + Official)^(252 / n()) - 1,
+            Tracking_Error   = sd(Returns - Official) * sqrt(252))
+```
+
+```{r data-tables, include=FALSE}
+# -------------------------------------------------------------------
+# Table: data used
+# -------------------------------------------------------------------
+fmt <- function(d) format(d, "%b %Y")
+
+Tab_Data <-
+  bind_rows(
+    Size_Idx %>%
+      group_by(Fund) %>%
+      summarise(Start = fmt(min(date)), End = fmt(max(date)),
+                Detail = paste0("Avg. ", round(n() / n_distinct(date)), " stocks")) %>%
+      transmute(Series = paste("Constituents & weights:", Fund),
+                Source = "Monthly_Index_Constituents", Frequency = "Monthly",
+                Start, End, Detail),
+    tibble(Series = "Daily stock returns", Source = "Stock_Returns_Daily",
+           Frequency = "Daily", Start = fmt(min(Stocks$date)), End = fmt(max(Stocks$date)),
+           Detail = paste(n_distinct(Stocks$Tickers), "stocks")),
+    Idx_Daily %>% filter(Tickers %in% c("J200", "J201", "J202", "J433")) %>%
+      group_by(Tickers) %>%
+      summarise(Start = fmt(min(date)), End = fmt(max(date))) %>%
+      transmute(Series = paste("Official index returns:", Tickers),
+                Source = "Index_Returns_Daily", Frequency = "Daily", Start, End,
+                Detail = "Validation"),
+    bind_rows(Implied %>% filter(Name == "VIX"),
+              Uncert %>% filter(Name == "EPUCGLCP"),
+              LCL_Cncy %>% select(-Description),
+              Commods %>% filter(Ticker == "CO1 Comdty")) %>%
+      group_by(Name) %>%
+      summarise(Start = fmt(min(date)), End = fmt(max(date))) %>%
+      transmute(Series = recode(Name, VIX = "VIX (US implied vol)",
+                                EPUCGLCP = "Global policy uncertainty (EPU)",
+                                SAVIUSD = "Rand implied vol (SAVIUSD)",
+                                Oil_Brent = "Brent crude (realised vol)"),
+                Source = "Macro series", Frequency = "Daily/monthly", Start, End,
+                Detail = "Stratification")
+  )
+
+# -------------------------------------------------------------------
+# Table: descriptive statistics of daily returns
+# Jarque-Bera normality test: JB = n/6 * (S^2 + K^2 / 4) ~ chi2(2)
+# -------------------------------------------------------------------
+Tab_Desc <-
+  Daily %>%
+  group_by(Index = Tickers) %>%
+  summarise(Obs               = n(),
+            `Mean (ann.)`     = mean(dlogret) * 252,
+            `SD (ann.)`       = sd(dlogret) * sqrt(252),
+            Skewness          = PerformanceAnalytics::skewness(dlogret),
+            `Excess kurtosis` = PerformanceAnalytics::kurtosis(dlogret, method = "excess"),
+            Min               = min(Returns),
+            Max               = max(Returns),
+            `Jarque-Bera p`   = 1 - pchisq(n() / 6 * (Skewness^2 + `Excess kurtosis`^2 / 4), df = 2)) %>%
+  mutate(Index = factor(Index, levels = c("LargeCaps", "MidCaps", "SmallCaps", "CappedSWIX"))) %>%
+  arrange(Index) %>%
+  mutate(Index = as.character(Index))
+```
+
+Table \ref{tab:data} lists the data. Monthly constituent weights for the three size indexes and the Capped SWIX come from the index constituents file. They are combined with daily returns for 277 JSE stocks to rebuild each index, which lets us look inside the indexes rather than only at their headline returns. The official index series (J200, J201, J202, J433) are used only to check the rebuild. Four macro series are used for stratification.
+
+```{r tab-data, results='asis'}
+tab_print(Tab_Data, caption = "Data used", label = "tab:data", size = "\\scriptsize")
+```
+
+Three data treatments matter:
+
+- **Missing sectors.** Sector labels are missing for many small-cap rows. Each stock is given the sector recorded for it elsewhere in the data; stocks with no record are labelled "Unclassified". This affects about 30% of small-cap weight before 2020 and about 10% afterwards.
+- **Weights.** Weights are rescaled to sum to one each month, after dropping the few holdings without return data.
+- **Returns.** For stock-level volatility, daily stock returns are capped at $\pm 25\%$ to limit data errors.
+
+Table \ref{tab:valid} shows that the rebuilt indexes track the official series closely: daily correlations of 0.98 to 0.99, and annualised returns within 0.3 percentage points.
+
+```{r tab-valid, results='asis'}
+tab_print(Validation %>% rename(Index = Tickers, `Ann. return (rebuilt)` = Ann_Ret_Rebuilt,
+                                `Ann. return (official)` = Ann_Ret_Official,
+                                `Tracking error` = Tracking_Error),
+          caption = "Validation: rebuilt versus official index returns (daily)",
+          label = "tab:valid")
+```
+
+Table \ref{tab:desc} reports descriptive statistics of the rebuilt daily returns. All four series are negatively skewed and fat-tailed, and normality is rejected for each (Jarque–Bera $p<0.001$). Small caps stand out: the lowest daily volatility, but by far the fattest tails (excess kurtosis of 23). That combination is the first hint that daily small-cap volatility understates their true risk (Section \ref{Vol}).
+
+```{r tab-desc, results='asis'}
+tab_print(Tab_Desc,
+          caption = "Descriptive statistics of daily index returns (Jan 2015 to Sep 2026)",
+          label = "tab:desc")
+```
+
+# Methodology \label{Method}
+
+## Index returns
+
+Each index return is built from its constituents. With $w_{i,t-1}$ the weight of stock $i$ at the previous month-end, and weights drifting with prices within the month:
+
+$$
+R_{p,t} = \sum_{i=1}^{N} w_{i,t-1} \, R_{i,t}, \qquad \sum_i w_{i,t-1} = 1.
+$$
+
+This is implemented with `rmsfuns::Safe_Return.portfolio`, as in the course practicals.
+
+## Concentration and active share
+
+Concentration is measured by the top-10 weight and by the effective number of stocks, the inverse of the Herfindahl–Hirschman index:
+
+$$
+N^{\text{eff}}_t = \frac{1}{\sum_i w_{i,t}^2}.
+$$
+
+$N^{\text{eff}}$ is the number of equally weighted stocks that would give the same concentration.
+
+Active share measures how much of an index's holdings differ from the benchmark [@cremers2009]:
+
+$$
+AS_t = \tfrac{1}{2}\sum_{i} \left| w^{\text{index}}_{i,t} - w^{\text{J433}}_{i,t} \right|.
+$$
+
+It runs from 0 (identical holdings) to 1 (no overlap).
+
+## Rolling returns and realised volatility
+
+The rolling three-year annualised return is
+
+$$
+R^{(36)}_t = \Big(\prod_{s=t-35}^{t} (1+R_s)\Big)^{12/36} - 1.
+$$
+
+Realised volatility uses daily log returns $r_t = \ln(1+R_t)$:
+
+$$
+\sigma^{RV}_t = \sqrt{252} \cdot \text{sd}\left(r_{t-251}, \dots, r_t\right).
+$$
+
+At constituent level, each stock's realised volatility is computed per calendar year. The diversification ratio compares index volatility with the average volatility of its stocks:
+
+$$
+DR = \frac{\sigma_{\text{index}}}{\sum_i \bar{w}_i \, \sigma_i}.
+$$
+
+A low $DR$ means combining the stocks removes much of their individual risk.
+
+## GJR-GARCH model
+
+Volatility is also modelled with a GJR-GARCH(1,1) [@glosten1993], which lets bad news raise volatility more than good news:
+
+$$
+r_t = \mu + \phi\, r_{t-1} + \varepsilon_t, \qquad \varepsilon_t = \sigma_t z_t, \qquad z_t \sim t_\nu,
+$$
+$$
+\sigma_t^2 = \omega + \left(\alpha + \gamma\, I_{t-1}\right)\varepsilon_{t-1}^2 + \beta\,\sigma_{t-1}^2, \qquad I_{t-1} = \begin{cases} 1 & \varepsilon_{t-1} < 0 \\ 0 & \text{otherwise.}\end{cases}
+$$
+
+- $\gamma > 0$ is the leverage effect.
+- Persistence is $\alpha + \beta + \gamma/2$, and the half-life of a volatility shock is $\ln(0.5)/\ln(\text{persistence})$ days.
+- Student-$t$ errors allow for the fat tails in Table \ref{tab:desc}.
+- Adequacy is checked with a Ljung–Box test on squared standardised residuals.
+
+## Stale prices
+
+Infrequent trading smooths measured returns [@scholes1977; @lo1990]. Three indicators are used:
+
+- the share of zero-return days;
+- the first-order autocorrelation of daily returns;
+- the ratio of volatility from monthly returns to volatility from daily returns ($\text{sd}(R^{m})\sqrt{12} \,/\, \text{sd}(R^{d})\sqrt{252}$). With serially independent returns this ratio is close to one; stale prices push it above one.
+
+## Stratification
+
+Following the course's stratification approach, months are sorted by a stratifying series $X_m$: J433 realised volatility, VIX, rand implied volatility, oil realised volatility and global policy uncertainty. High (low) months are the top (bottom) quintile of $X_m$. Daily returns are winsorised at the 1st and 99th percentiles. For each index:
+
+- the volatility ratio is $\sigma_{\text{High}}/\sigma_{\text{Full}}$;
+- the monthly excess return over J433 is compared between High and Low months with a Welch two-sample $t$-test.
+
+# Results \label{Results}
+
+## Sector exposure
+
+```{r sector, include=FALSE}
+# -------------------------------------------------------------------
+# Sector exposure over time (Practical 2 / Bonus 2: weights from holdings)
+# -------------------------------------------------------------------
+Sector_W <-
+  W_df %>%
+  group_by(Fund, date, Sector) %>%
+  summarise(Weight = sum(weight), .groups = "drop")
+
+g_sector <-
+  Sector_W %>%
+  ggplot() +
+  geom_area(aes(date, Weight, fill = Sector), alpha = 0.85) +
+  facet_wrap(~Fund, nrow = 1) +
+  labs(title = "Sector exposure of the size indexes",
+       subtitle = "Re-scaled month-end constituent weights",
+       x = "", y = "Weight",
+       caption = "Note:\nUnclassified = no sector recorded in the data. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_fills()
+
+# Average sector weights by period
+Sector_Table <-
+  Sector_W %>%
+  mutate(Period = ifelse(date < ymd(20200101), "2015-2019", "2020-2026")) %>%
+  group_by(Fund, Period, Sector) %>%
+  summarise(Weight = mean(Weight), .groups = "drop") %>%
+  pivot_wider(names_from = Sector, values_from = Weight, values_fill = 0)
+
+# Largest holdings at the latest date (used in the text)
+Top_Now <-
+  W_df %>% filter(date == max(date), Fund != "CappedSWIX") %>%
+  group_by(Fund) %>% slice_max(weight, n = 5) %>%
+  select(Fund, Tickers, Sector, weight)
+```
+
+The three indexes carry very different sector bets (Figure \ref{Figure1}, Table \ref{tab:sector}).
+
+- **Large caps carry the market's Resources risk.** Resources rose from about 20% of the index in 2015–19 to 35–40% by 2026, led by the gold miners; Gold Fields and AngloGold Ashanti are now the two largest holdings.
+- **Mid caps have shifted from Property towards Financials**, with Financials more than doubling, from 12% to 28%.
+- **Small caps are effectively a Property and Industrials index**, with little exposure to Resources or Financials.
+
+```{r Figure1, fig.cap = "Sector exposure of the size indexes \\label{Figure1}", fig.height = 4.2}
+fmxdat::finplot(g_sector, x.date.dist = "2 years", x.date.type = "%Y",
+                x.vert = TRUE, y.pct = TRUE, y.pct_acc = 1)
+```
+
+```{r tab-sector, results='asis'}
+tab_print(Sector_Table %>% rename(Index = Fund),
+          caption = "Average sector weights by period", label = "tab:sector",
+          size = "\\scriptsize")
+```
+
+## Concentration
+
+```{r concentration, include=FALSE}
+# -------------------------------------------------------------------
+# Concentration: number of stocks, top-10 weight, effective N = 1 / HHI
+# -------------------------------------------------------------------
+Concentration <-
+  W_df %>%
+  group_by(Fund, date) %>%
+  arrange(desc(weight), .by_group = TRUE) %>%
+  summarise(N = n(),
+            Top10 = sum(head(weight, 10)),
+            HHI = sum(weight^2),
+            Eff_N = 1 / HHI, .groups = "drop")
+
+g_conc <-
+  Concentration %>%
+  select(date, Fund, `Top-10 weight` = Top10, `Effective N` = Eff_N) %>%
+  pivot_longer(c(`Top-10 weight`, `Effective N`)) %>%
+  ggplot() +
+  geom_line(aes(date, value, color = Fund), linewidth = 1) +
+  facet_wrap(~name, scales = "free_y") +
+  labs(title = "Stock concentration of the size indexes",
+       x = "", y = "",
+       caption = "Note:\nEffective N = 1 / sum of squared weights. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+
+Conc_Table <-
+  Concentration %>%
+  mutate(Period = case_when(date < ymd(20200101) ~ "1. 2015-2019",
+                            date < ymd(20240101) ~ "2. 2020-2023",
+                            TRUE ~ "3. 2024-2026")) %>%
+  group_by(Fund, Period) %>%
+  summarise(across(c(N, Top10, Eff_N), mean), .groups = "drop")
+```
+
+Large caps are the most concentrated index (Figure \ref{Figure2}, Table \ref{tab:conc}). Until mid-2023, ten stocks held about two-thirds of the index ($N^{\text{eff}} \approx 14$). A clear break in mid-2023 lowered the top-10 weight to about 55%. Its cause is not visible in the data; a change in index methodology or capping is one possibility.
+
+Mid caps have moved the other way. Their effective number of stocks fell from 38 to 27, so mid-cap returns now rest on fewer names. Small caps remain the most diversified.
+
+```{r Figure2, fig.cap = "Stock concentration: top-10 weight and effective number of stocks \\label{Figure2}"}
+fmxdat::finplot(g_conc, x.date.dist = "2 years", x.date.type = "%Y", x.vert = TRUE)
+```
+
+```{r tab-conc, results='asis'}
+tab_print(Conc_Table %>% rename(Index = Fund, `Stocks (N)` = N, `Top-10 weight` = Top10,
+                                `Effective N` = Eff_N),
+          caption = "Concentration by period (averages)", label = "tab:conc", digits = 2)
+```
+
+## Active share relative to the Capped SWIX
+
+```{r active-share, include=FALSE}
+# -------------------------------------------------------------------
+# Active share (Cremers & Petajisto, 2009): 0.5 * sum |w_index - w_J433|
+# 0 = identical to the benchmark; 1 = no overlap at all.
+# -------------------------------------------------------------------
+BM_W <- W_df %>% filter(Fund == "CappedSWIX") %>%
+  select(date, Tickers, w_bm = weight)
+
+Active_Share <-
+  W_df %>%
+  filter(Fund != "CappedSWIX") %>%
+  select(date, Fund, Tickers, w_idx = weight) %>%
+  group_by(Fund) %>%
+  group_modify(~ full_join(.x, BM_W, by = c("date", "Tickers"))) %>%
+  ungroup() %>%
+  mutate(across(c(w_idx, w_bm), ~replace_na(., 0))) %>%
+  group_by(Fund, date) %>%
+  summarise(Active_Share = 0.5 * sum(abs(w_idx - w_bm)),
+            # share of the benchmark held by the index
+            BM_Coverage = sum(w_bm[w_idx > 0]), .groups = "drop")
+
+g_as <-
+  Active_Share %>%
+  ggplot() +
+  geom_line(aes(date, Active_Share, color = Fund), linewidth = 1) +
+  labs(title = "Active share of the size indexes vs the Capped SWIX",
+       x = "", y = "Active share",
+       caption = "Note:\nActive share = 0.5 x sum of absolute weight differences. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+
+AS_Table <-
+  Active_Share %>%
+  mutate(Period = case_when(date < ymd(20200101) ~ "1. 2015-2019",
+                            date < ymd(20240101) ~ "2. 2020-2023",
+                            TRUE ~ "3. 2024-2026")) %>%
+  group_by(Fund, Period) %>%
+  summarise(across(c(Active_Share, BM_Coverage), mean), .groups = "drop")
+
+# Overlap between size indexes (stocks held in two indexes at once)
+Overlap <-
+  W_df %>% filter(Fund != "CappedSWIX") %>%
+  group_by(date, Tickers) %>% filter(n() > 1) %>%
+  summarise(Funds = paste(sort(Fund), collapse = " & "), .groups = "drop") %>%
+  count(date, Funds) %>% group_by(Funds) %>%
+  summarise(Months = n(), Avg_Stocks = mean(n), Max_Stocks = max(n))
+```
+
+Large caps are increasingly close to the benchmark (Figure \ref{Figure3}, Table \ref{tab:as}). Their active share halved, from 29% in 2015–19 to 15% in 2024–26. A large-cap tilt therefore adds little that is different from J433.
+
+Mid and small caps are genuinely different portfolios, with active shares of about 75% and 93%. Small caps hold stocks that make up only about 7% of the Capped SWIX, which makes them a true diversifier relative to the benchmark.
+
+One data feature is worth noting: in most months, about 12 stocks sit in both the large- and mid-cap indexes at the same time, with a small large-cap weight. This appears to reflect stocks migrating between size bands; the weights are used as given.
+
+```{r Figure3, fig.cap = "Active share of the size indexes relative to the Capped SWIX \\label{Figure3}"}
+fmxdat::finplot(g_as, x.date.dist = "1 year", x.date.type = "%Y",
+                x.vert = TRUE, y.pct = TRUE, y.pct_acc = 1)
+```
+
+```{r tab-as, results='asis'}
+tab_print(AS_Table %>% rename(Index = Fund, `Active share` = Active_Share,
+                              `Share of J433 weight held` = BM_Coverage),
+          caption = "Active share relative to the Capped SWIX", label = "tab:as")
+```
+
+## Risk and return
+
+```{r moments, include=FALSE}
+# -------------------------------------------------------------------
+# Monthly returns and statistics table (Bonus 12: Moments_Comp)
+# -------------------------------------------------------------------
+Monthly_Ret <-
+  Daily %>%
+  mutate(YM = format(date, "%Y%m")) %>%
+  group_by(Tickers, YM) %>%
+  summarise(date = dplyr::last(date), Ret = prod(1 + Returns) - 1,
+            .groups = "drop")
+
+Moments_Comp <- function(funds, BM, Yrs_LookBack) {
+
+  funds_considered <-
+    funds %>% filter(date >= fmxdat::safe_year_min(datesel = dplyr::last(date),
+                                                    N = Yrs_LookBack))
+
+  Fundxts <- funds_considered %>%
+    tbl_xts(cols_to_xts = Ret, spread_by = Tickers, Colnames_Exact = TRUE)
+  BMxts   <- funds_considered %>% filter(Tickers == BM) %>%
+    tbl_xts(cols_to_xts = Ret, Colnames_Exact = TRUE)
+
+  # Forces every statistic into one row (one column per index)
+  one_row <- function(x) {
+    x <- as.matrix(x)
+    if (nrow(x) > 1) x <- t(x)
+    out <- data.frame(x)
+    colnames(out) <- colnames(Fundxts)
+    out
+  }
+
+  bind_rows(
+    one_row(Return.cumulative(Fundxts)),
+    one_row(Return.annualized(Fundxts, scale = 12, geometric = TRUE)),
+    one_row(Return.annualized.excess(Fundxts, BMxts)),
+    one_row(sd.annualized(Fundxts, scale = 12, geometric = TRUE)),
+    one_row(SharpeRatio.annualized(Fundxts, Rf = 0, scale = 12)),
+    one_row(maxDrawdown(Fundxts)),
+    one_row(PainIndex(Fundxts, scale = 12, geometric = TRUE)),
+    one_row(fmxdat::Safe_TE(Ra = Fundxts, Rb = BMxts, scale = 12)),
+    one_row(CAPM.beta(Ra = Fundxts, Rb = BMxts, Rf = 0)),
+    one_row(UpDownRatios(Ra = Fundxts, Rb = BMxts, method = "Capture", side = "Up")),
+    one_row(UpDownRatios(Ra = Fundxts, Rb = BMxts, method = "Capture", side = "Down")),
+    one_row(CVaR(R = Fundxts, p = 0.95, method = "modified"))
+  ) %>%
+    mutate(Period = glue::glue("Last {Yrs_LookBack} Years"),
+           Info = c("Cum Returns", "Returns (Ann.)", "Returns Excess (Ann.)",
+                    "SD (Ann.)", "Return / Risk", "Max Drawdown", "Pain Index",
+                    "Tracking Error", "Beta", "Up Capture", "Down Capture",
+                    "Modified CVaR (95%, monthly)")) %>%
+    relocate(Period, Info) %>%
+    as_tibble()
+}
+
+Tab_stats <-
+  bind_rows(
+    Moments_Comp(Monthly_Ret, BM = "CappedSWIX", Yrs_LookBack = 3),
+    Moments_Comp(Monthly_Ret, BM = "CappedSWIX", Yrs_LookBack = 5),
+    Moments_Comp(Monthly_Ret, BM = "CappedSWIX", Yrs_LookBack = 10)
+  )
+```
+
+Table \ref{tab:stats} compares the indexes over the last ten years using monthly returns.
+
+- **Large caps** delivered the best balance of return and risk: 11.6% a year, a 22.6% maximum drawdown and a beta of about one.
+- **Small caps** matched that return (11.4%) with a beta of only 0.73, but suffered the deepest drawdown (41.5%).
+- **Mid caps** lagged, at 6.9% a year.
+
+```{r tab-stats, results='asis'}
+tab_print(Tab_stats %>% filter(Period == "Last 10 Years") %>% select(-Period) %>%
+            select(Info, LargeCaps, MidCaps, SmallCaps, CappedSWIX),
+          caption = "Risk and return statistics, last 10 years (monthly returns, benchmark J433)",
+          label = "tab:stats")
+```
+
+```{r rolling-returns, include=FALSE}
+# -------------------------------------------------------------------
+# Rolling 3-year annualised returns (Practical 1: RcppRoll::roll_prod)
+# -------------------------------------------------------------------
+Roll_Ret <-
+  Monthly_Ret %>%
+  group_by(Tickers) %>%
+  arrange(date) %>%
+  mutate(RollRets = RcppRoll::roll_prod(1 + Ret, n = 36, fill = NA,
+                                        align = "right")^(12 / 36) - 1) %>%
+  ungroup() %>%
+  filter(!is.na(RollRets))
+
+g_rollret <-
+  Roll_Ret %>%
+  ggplot() +
+  geom_line(aes(date, RollRets, color = Tickers), linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  labs(title = "Rolling 3-year annualised returns: size indexes",
+       x = "", y = "Annualised return",
+       caption = "Note:\nIndexes rebuilt from constituents. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+
+# How often did each index beat the Capped SWIX over 3-year windows?
+Roll_Win <-
+  Roll_Ret %>%
+  select(date, Tickers, RollRets) %>%
+  pivot_wider(names_from = Tickers, values_from = RollRets) %>%
+  summarise(across(c(LargeCaps, MidCaps, SmallCaps),
+                   list(Beat_BM = ~mean(. > CappedSWIX),
+                        Avg_Gap = ~mean(. - CappedSWIX))))
+```
+
+Rolling three-year returns (Figure \ref{Figure4}) show how consistent these outcomes were.
+
+- **Large caps beat the Capped SWIX in 96% of three-year windows**, by about 2.5% a year on average.
+- **Small caps won 64% of the time but swung widely**, from $-16\%$ a year in 2019–20 to about 37% in 2022–23.
+- **Mid caps beat the benchmark in only 26% of windows.**
+
+```{r Figure4, fig.cap = "Rolling three-year annualised returns \\label{Figure4}"}
+fmxdat::finplot(g_rollret, x.date.dist = "1 year", x.date.type = "%Y",
+                x.vert = TRUE, y.pct = TRUE, y.pct_acc = 1)
+```
+
+## Realised volatility \label{Vol}
+
+```{r rolling-vol, include=FALSE}
+# -------------------------------------------------------------------
+# Rolling 1-year realised volatility (Practical 1: RcppRoll::roll_sd)
+# -------------------------------------------------------------------
+Roll_SD <-
+  Daily %>%
+  group_by(Tickers) %>%
+  arrange(date) %>%
+  mutate(RollSD = RcppRoll::roll_sd(dlogret, n = 252, fill = NA,
+                                    align = "right") * sqrt(252)) %>%
+  ungroup() %>%
+  filter(!is.na(RollSD))
+
+g_rollsd <-
+  Roll_SD %>%
+  ggplot() +
+  geom_line(aes(date, RollSD, color = Tickers), linewidth = 1) +
+  labs(title = "Rolling 1-year realised volatility: size indexes",
+       x = "", y = "Annualised SD",
+       caption = "Note:\nDaily log returns, 252-day window. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+```
+
+At index level, all three size indexes became much more volatile in 2020 (about 29–32%), then settled (Figure \ref{Figure5}). Small caps were consistently the calmest on daily data: about 12% since 2024, against 17% for large and mid caps.
+
+```{r Figure5, fig.cap = "Rolling one-year realised volatility \\label{Figure5}"}
+fmxdat::finplot(g_rollsd, x.date.dist = "1 year", x.date.type = "%Y",
+                x.vert = TRUE, y.pct = TRUE, y.pct_acc = 1)
+```
+
+```{r constituent-vol, include=FALSE}
+# -------------------------------------------------------------------
+# Realised volatility of the CONSTITUENTS
+# a) Yearly realised vol per stock. Daily returns capped at +-25% to limit
+#    data errors; a stock needs >= 100 trading days in the year.
+# -------------------------------------------------------------------
+Stock_RV <-
+  Stocks %>%
+  mutate(Returns = pmin(pmax(Returns, -0.25), 0.25),
+         dlogret = log(1 + Returns), Year = year(date)) %>%
+  group_by(Tickers, Year) %>%
+  summarise(RV = sd(dlogret, na.rm = TRUE) * sqrt(252),
+            N_days = sum(!is.na(dlogret)), .groups = "drop") %>%
+  filter(N_days >= 100)
+
+# b) Assign each stock to ONE size index per year: the index it sat in for
+#    most months (ties: the larger average weight).
+Membership <-
+  Size_Idx %>%
+  filter(Fund != "CappedSWIX", date >= ymd(20150101)) %>%
+  mutate(Year = year(date)) %>%
+  group_by(Tickers, Year, Fund) %>%
+  summarise(Months = n(), Avg_W = mean(Weight), .groups = "drop") %>%
+  group_by(Tickers, Year) %>%
+  arrange(desc(Months), desc(Avg_W), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup()
+
+Const_RV <- inner_join(Membership, Stock_RV, by = c("Tickers", "Year"))
+
+g_constrv <-
+  Const_RV %>%
+  ggplot() +
+  geom_boxplot(aes(factor(Year), RV, fill = Fund), outlier.alpha = 0.3,
+               outlier.size = 0.8) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(title = "Realised volatility of index constituents, by year",
+       subtitle = "Each box = distribution of stock-level annualised volatility",
+       x = "", y = "Annualised SD",
+       caption = "Note:\nStocks assigned to the size index they sat in for most of the year. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_fills()
+
+# c) Typical stock vol vs index vol: the diversification ratio
+Const_Summary <-
+  Const_RV %>%
+  group_by(Fund, Year) %>%
+  summarise(Median_Stock_RV = median(RV),
+            WAvg_Stock_RV   = weighted.mean(RV, Avg_W),
+            IQR_Stock_RV    = IQR(RV), .groups = "drop") %>%
+  left_join(Daily %>% mutate(Year = year(date)) %>%
+              group_by(Tickers, Year) %>%
+              summarise(Index_RV = sd(dlogret) * sqrt(252), .groups = "drop"),
+            by = c("Fund" = "Tickers", "Year")) %>%
+  mutate(Div_Ratio = Index_RV / WAvg_Stock_RV)
+
+Const_Period <-
+  Const_Summary %>%
+  mutate(Period = case_when(Year < 2020 ~ "1. 2015-2019",
+                            Year == 2020 ~ "2. 2020",
+                            Year < 2024 ~ "3. 2021-2023",
+                            TRUE ~ "4. 2024-2026")) %>%
+  group_by(Fund, Period) %>%
+  summarise(across(c(Median_Stock_RV, WAvg_Stock_RV, IQR_Stock_RV,
+                     Index_RV, Div_Ratio), mean), .groups = "drop")
+```
+
+The constituent view reverses this picture (Figure \ref{Figure6}, Table \ref{tab:const}).
+
+- **Individual small-cap stocks are the most volatile** (median of about 36% in 2015–19, against 28% for large caps).
+- **Yet the small-cap index is the calmest**, because its stocks move largely independently. Its diversification ratio is 0.28–0.41, against about 0.5 for large and mid caps.
+- **In 2020 the ratio rose sharply**: stocks moved together and diversification disappeared when it was needed most.
+
+```{r Figure6, fig.cap = "Distribution of constituent realised volatility by year \\label{Figure6}", fig.height = 4.2}
+fmxdat::finplot(g_constrv, y.pct = TRUE, y.pct_acc = 1)
+```
+
+```{r tab-const, results='asis'}
+tab_print(Const_Period %>% rename(Index = Fund, `Median stock vol` = Median_Stock_RV,
+                                  `Wtd. avg. stock vol` = WAvg_Stock_RV,
+                                  `IQR stock vol` = IQR_Stock_RV, `Index vol` = Index_RV,
+                                  `Diversification ratio` = Div_Ratio),
+          caption = "Constituent versus index realised volatility", label = "tab:const",
+          size = "\\scriptsize")
+```
+
+```{r stale, include=FALSE}
+# -------------------------------------------------------------------
+# Stale-price check: is small-cap volatility understated?
+# Illiquid stocks often do not trade, so their price is unchanged for the
+# day. This smooths daily returns (low daily vol, positive autocorrelation),
+# so vol from MONTHLY returns exceeds daily vol x sqrt(252).
+# -------------------------------------------------------------------
+Stale_Check <-
+  Daily %>%
+  group_by(Tickers) %>%
+  arrange(date) %>%
+  summarise(AC1_daily = cor(Returns, dplyr::lag(Returns), use = "complete.obs"),
+            SD_from_daily = sd(Returns) * sqrt(252)) %>%
+  left_join(Monthly_Ret %>% group_by(Tickers) %>%
+              summarise(SD_from_monthly = sd(Ret) * sqrt(12)), by = "Tickers") %>%
+  mutate(Ratio = SD_from_monthly / SD_from_daily)
+
+# Share of zero-return days for the stocks in each size index
+Zero_Days <-
+  Stocks %>%
+  inner_join(Membership %>% distinct(Tickers, Fund), by = "Tickers",
+             relationship = "many-to-many") %>%
+  group_by(Fund) %>%
+  summarise(Zero_Return_Days = mean(Returns == 0, na.rm = TRUE))
+
+Stale_Table <-
+  Stale_Check %>%
+  left_join(Zero_Days, by = c("Tickers" = "Fund"))
+```
+
+Part of the small caps' calm is, however, an illusion (Table \ref{tab:stale}).
+
+- Small-cap stocks do not trade on about 11% of days.
+- Small-cap daily index returns are positively autocorrelated.
+- Volatility measured on monthly returns is higher than on daily returns (ratio 1.06); for large caps the ratio is 0.80.
+
+These are the signatures of stale prices. Daily small-cap volatility understates true risk, which is consistent with the fat tails in Table \ref{tab:desc} and the 41.5% drawdown.
+
+```{r tab-stale, results='asis'}
+tab_print(Stale_Table %>% rename(Index = Tickers, `AC(1) daily` = AC1_daily,
+                                 `SD from daily` = SD_from_daily,
+                                 `SD from monthly` = SD_from_monthly,
+                                 `Monthly / daily` = Ratio,
+                                 `Zero-return days` = Zero_Return_Days),
+          caption = "Stale-price diagnostics", label = "tab:stale")
+```
+
+```{r garch, include=FALSE}
+# -------------------------------------------------------------------
+# GJR-GARCH(1,1), AR(1) mean, Student-t errors (Practical 6: rugarch)
+# Same specification as Q1A.
+# -------------------------------------------------------------------
+garch_spec <-
+  ugarchspec(variance.model = list(model = "gjrGARCH", garchOrder = c(1, 1)),
+             mean.model = list(armaOrder = c(1, 0), include.mean = TRUE),
+             distribution.model = "std")
+
+Garch_Fitter <- function(df, Ticker_Sel, spec) {
+  x <- df %>% filter(Tickers == Ticker_Sel) %>% tbl_xts(cols_to_xts = dlogret)
+  ugarchfit(spec = spec, data = x)
+}
+
+Idx_Names <- c("LargeCaps", "MidCaps", "SmallCaps", "CappedSWIX")
+Fits <- map(Idx_Names, ~Garch_Fitter(Daily, .x, garch_spec)) %>%
+  set_names(Idx_Names)
+
+# Diagnostics: squared standardised residuals should show no ARCH left
+LB_p <- map_dbl(Fits, ~Box.test(residuals(.x, standardize = TRUE)^2,
+                                type = "Ljung-Box", lag = 12)$p.value)
+
+# Key parameters side by side
+Garch_Table <-
+  map_df(Idx_Names, function(nm) {
+    cf <- coef(Fits[[nm]])
+    tibble(Index = nm, alpha = cf["alpha1"], beta = cf["beta1"],
+           gamma = cf["gamma1"], gamma_p = Fits[[nm]]@fit$matcoef["gamma1", 4],
+           shape = cf["shape"], Persistence = persistence(Fits[[nm]]),
+           Half_Life_days = log(0.5) / log(persistence(Fits[[nm]])),
+           LB_sq_p = LB_p[[nm]])
+  })
+
+Sigma_df <-
+  map_df(Idx_Names, function(nm) {
+    sigma(Fits[[nm]]) %>% xts_tbl() %>%
+      purrr::set_names(c("date", "sigma")) %>%
+      mutate(date = as.Date(date), Tickers = nm)
+  }) %>%
+  mutate(Ann_Sigma = sigma * sqrt(252))
+
+g_sigma <-
+  Sigma_df %>%
+  ggplot() +
+  geom_line(aes(date, Ann_Sigma, color = Tickers), linewidth = 0.8, alpha = 0.85) +
+  labs(title = "GJR-GARCH(1,1) conditional volatility: size indexes",
+       x = "", y = "Annualised conditional SD",
+       caption = "Note:\nAR(1) mean, Student-t errors. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+```
+
+The GJR-GARCH estimates (Table \ref{tab:garch}, Figure \ref{Figure7}) add a further difference.
+
+- **Large-cap volatility reacts almost only to bad news** ($\alpha \approx 0$, $\gamma = 0.15$), like the Capped SWIX.
+- **Small and mid caps respond more symmetrically** (higher $\alpha$, lower $\gamma$). Their volatility is driven more by stock-specific news than by market sell-offs.
+- **Shocks fade quickly** in all indexes, with half-lives of 12–18 trading days.
+- **The models are adequate**: none of the Ljung–Box tests on squared standardised residuals rejects ($p$ = 0.35 to 0.99).
+
+```{r Figure7, fig.cap = "GJR-GARCH(1,1) conditional volatility \\label{Figure7}"}
+fmxdat::finplot(g_sigma, x.date.dist = "1 year", x.date.type = "%Y",
+                x.vert = TRUE, y.pct = TRUE, y.pct_acc = 1)
+```
+
+## Stratification: calm versus stressed months
+
+```{r stratification, include=FALSE}
+# -------------------------------------------------------------------
+# Stratification (Bonus 2): monthly buckets, returns winsorised at 1%/99%,
+# extreme months = top / bottom quintile of each stratifying series.
+# -------------------------------------------------------------------
+Idxs <-
+  Rebuilt %>%
+  rename(Return = Returns) %>%
+  group_by(Tickers) %>%
+  mutate(Top = quantile(Return, 0.99), Bot = quantile(Return, 0.01)) %>%
+  mutate(Return = ifelse(Return > Top, Top,
+                         ifelse(Return < Bot, Bot, Return))) %>%
+  ungroup() %>%
+  select(date, Tickers, Return) %>%
+  mutate(YearMonth = format(date, "%Y%m"))
+
+# (a) Local market stress: the Capped SWIX's own realised vol each month
+J433_RV <-
+  Idxs %>% filter(Tickers == "CappedSWIX") %>%
+  group_by(YearMonth) %>%
+  summarise(Value = sd(Return) * sqrt(252), .groups = "drop") %>%
+  mutate(Name = "J433 realised vol")
+
+# (b) Levels: rand implied vol (SAVIUSD), VIX, global policy uncertainty
+Levels <-
+  bind_rows(Implied, Uncert, LCL_Cncy %>% select(-Description)) %>%
+  filter(Ticker %in% c("VIX Index", "EPUCGLCP Index", "SAVIUSD Index")) %>%
+  mutate(YearMonth = format(date, "%Y%m"),
+         Name = recode(Name, SAVIUSD = "Rand implied vol (SAVIUSD)",
+                       VIX = "VIX", EPUCGLCP = "Global policy uncertainty")) %>%
+  group_by(Name, YearMonth) %>%
+  summarise(Value = mean(TRI, na.rm = TRUE), .groups = "drop")
+
+# (c) Oil: Brent is a price, so use its monthly realised volatility
+Oil_RV <-
+  Commods %>%
+  filter(Ticker == "CO1 Comdty") %>%
+  arrange(date) %>%
+  mutate(dlogret = log(TRI) - log(lag(TRI))) %>%
+  filter(!is.na(dlogret)) %>%
+  mutate(YearMonth = format(date, "%Y%m")) %>%
+  group_by(YearMonth) %>%
+  summarise(Value = sd(dlogret) * sqrt(252), .groups = "drop") %>%
+  mutate(Name = "Oil realised vol")
+
+# Keep months in the index sample only, then define quintiles
+Strat <-
+  bind_rows(J433_RV, Levels, Oil_RV) %>%
+  filter(YearMonth %in% unique(Idxs$YearMonth)) %>%
+  group_by(Name) %>%
+  mutate(TopQtile = quantile(Value, 0.8),
+         BotQtile = quantile(Value, 0.2)) %>%
+  ungroup()
+
+# Perf_comparisons (Bonus 2): SD in extreme months vs full-sample SD
+Perf_comparisons <- function(Idxs, YMs, Alias) {
+  Idxs %>%
+    group_by(Tickers) %>%
+    mutate(Full_SD = sd(Return) * sqrt(252)) %>%
+    filter(YearMonth %in% YMs) %>%
+    summarise(SD = sd(Return) * sqrt(252),
+              across(.cols = starts_with("Full"), .fns = max)) %>%
+    arrange(desc(SD)) %>%
+    mutate(Period = Alias) %>%
+    group_by(Tickers) %>%
+    mutate(Ratio = SD / Full_SD) %>%
+    ungroup()
+}
+
+SD_Results <-
+  map_df(unique(Strat$Name), function(nm) {
+    Hi_Vol  <- Strat %>% filter(Name == nm, Value > TopQtile) %>% pull(YearMonth)
+    Low_Vol <- Strat %>% filter(Name == nm, Value < BotQtile) %>% pull(YearMonth)
+    bind_rows(Perf_comparisons(Idxs, YMs = Hi_Vol,  Alias = "High"),
+              Perf_comparisons(Idxs, YMs = Low_Vol, Alias = "Low")) %>%
+      mutate(Stratifier = nm)
+  })
+
+# Returns in extreme months, relative to the Capped SWIX
+Monthly_W <-
+  Idxs %>%
+  group_by(Tickers, YearMonth) %>%
+  summarise(Ret = prod(1 + Return) - 1, .groups = "drop")
+
+Excess <-
+  Monthly_W %>%
+  left_join(Monthly_W %>% filter(Tickers == "CappedSWIX") %>%
+              select(YearMonth, BM = Ret), by = "YearMonth") %>%
+  filter(Tickers != "CappedSWIX") %>%
+  mutate(Excess = Ret - BM)
+
+Ret_Results <-
+  Excess %>%
+  inner_join(Strat, by = "YearMonth", relationship = "many-to-many") %>%
+  mutate(State = case_when(Value > TopQtile ~ "High",
+                           Value < BotQtile ~ "Low",
+                           TRUE ~ "Middle")) %>%
+  filter(State != "Middle") %>%
+  group_by(Stratifier = Name, Tickers, State) %>%
+  summarise(Months = n(),
+            Avg_Ret = mean(Ret),
+            Avg_Excess = mean(Excess),
+            Hit_Rate = mean(Excess > 0), .groups = "drop")
+
+# Welch two-sample t-test: excess return in High vs Low months
+T_Tests <-
+  Excess %>%
+  inner_join(Strat, by = "YearMonth", relationship = "many-to-many") %>%
+  mutate(State = case_when(Value > TopQtile ~ "High",
+                           Value < BotQtile ~ "Low", TRUE ~ NA_character_)) %>%
+  filter(!is.na(State)) %>%
+  group_by(Stratifier = Name, Tickers) %>%
+  summarise(Diff_Hi_minus_Lo = mean(Excess[State == "High"]) - mean(Excess[State == "Low"]),
+            p_value = t.test(Excess[State == "High"], Excess[State == "Low"])$p.value,
+            .groups = "drop")
+
+g_strat <-
+  Ret_Results %>%
+  mutate(State = factor(State, levels = c("Low", "High"))) %>%
+  ggplot() +
+  geom_col(aes(Tickers, Avg_Excess, fill = State), position = "dodge") +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~Stratifier, nrow = 1, labeller = label_wrap_gen(width = 14)) +
+  labs(title = "Size indexes in calm vs stressed months",
+       subtitle = "High / Low = top / bottom quintile of each series",
+       x = "", y = "Avg monthly excess return",
+       caption = "Note:\nDaily returns winsorised at 1% / 99%. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_fills() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Every size index becomes much more volatile in stressed months (Table \ref{tab:stratsd}), so size offers no shelter from volatility. Small caps react most to global fear (VIX), and mid caps least to local stress. Global policy uncertainty barely changes volatility.
+
+```{r tab-stratsd, results='asis'}
+tab_print(SD_Results %>% select(Stratifier, Period, Tickers, Ratio) %>%
+            pivot_wider(names_from = Tickers, values_from = Ratio) %>%
+            select(Stratifier, Period, LargeCaps, MidCaps, SmallCaps, CappedSWIX) %>%
+            arrange(Stratifier, Period),
+          caption = "Volatility in extreme months relative to the full sample (ratio)",
+          label = "tab:stratsd", digits = 2, size = "\\scriptsize")
+```
+
+Relative returns, however, depend on **local** stress only (Table \ref{tab:strattt}, Figure \ref{Figure8}).
+
+- **In calm months, large caps lead the market**, beating J433 by 0.7% a month in 68% of months.
+- **In turbulent months, the leadership flips.** Mid and small caps beat J433 by about 0.8% a month, while large caps lag in three out of four months.
+- **The differences are significant** for large caps ($p = 0.01$) and mid caps ($p = 0.02$).
+- **Global stratifiers (VIX, oil, the rand, policy uncertainty) produce no significant size effect** (all $p > 0.19$). Global shocks hit all size segments similarly, so a size tilt is not a hedge against offshore uncertainty.
+
+The small-cap result should be read with the stale-price caveat in mind: lagged prices make falls look smaller. The mid-cap result does not suffer from this.
+
+```{r tab-strattt, results='asis'}
+tab_print(T_Tests %>%
+            rename(Index = Tickers, `High minus Low (monthly)` = Diff_Hi_minus_Lo,
+                   `p-value` = p_value),
+          caption = "Monthly excess return over J433: High minus Low months (Welch t-test)",
+          label = "tab:strattt", digits = 4, size = "\\scriptsize")
+```
+
+```{r Figure8, fig.cap = "Average monthly excess return over J433 in calm and stressed months \\label{Figure8}", fig.height = 4.6}
+fmxdat::finplot(g_strat, y.pct = TRUE, y.pct_acc = 0.1)
+```
+
+# Model summary \label{Summary}
+
+Table \ref{tab:garch} summarises the volatility model, and Table \ref{tab:summary} summarises the evidence from each technique.
+
+```{r tab-garch, results='asis'}
+tab_print(Garch_Table %>% rename(`gamma p-value` = gamma_p,
+                                 `Half-life (days)` = Half_Life_days,
+                                 `LB p (sq. resid.)` = LB_sq_p),
+          caption = "GJR-GARCH(1,1) estimates: AR(1) mean, Student-t errors",
+          label = "tab:garch")
+```
+
+```{r tab-summary, results='asis'}
+Summary_Tab <- tibble(
+  Technique = c("Sector weights", "Concentration", "Active share",
+                "Rolling returns", "Realised volatility", "Stale-price checks",
+                "GJR-GARCH", "Stratification"),
+  `Large caps` = c("Resources-heavy (35-40%)", "Most concentrated", "Low (15%): close to J433",
+                   "Beat J433 in 96% of 3y windows", "Mid-range", "Clean",
+                   "Strong bad-news effect", "Lead in calm months"),
+  `Mid caps`   = c("Financials rising (28%)", "Rising concentration", "High (75%)",
+                   "Beat J433 in 26% of windows", "Mid-range", "Minor",
+                   "More symmetric", "Lead in stressed months"),
+  `Small caps` = c("Property & Industrials", "Most diversified", "Very high (93%)",
+                   "Volatile: -16% to +37% p.a.", "Lowest (index), highest (stocks)",
+                   "Strong: vol understated", "Most symmetric", "Lead in stressed months*")
+)
+print(xtable::xtable(Summary_Tab, caption = "Summary of findings by technique",
+                     label = "tab:summary",
+                     align = c("l", "p{2.6cm}", "p{3.6cm}", "p{3.6cm}", "p{3.6cm}")),
+      include.rownames = FALSE, comment = FALSE, table.placement = "!htbp",
+      caption.placement = "top", size = "\\scriptsize")
+```
+
+\noindent \footnotesize{* Subject to the stale-price caveat in Section \ref{Vol}.} \normalsize
+
+The three size indexes offer distinct exposures:
+
+- **Large caps** are a concentrated Resources and gold bet that has converged towards the Capped SWIX. They led the market over most of the sample and in calm months, but their volatility reacts sharply to bad news.
+- **Mid caps** are a Financials-tilted, increasingly concentrated portfolio far from the benchmark. They underperformed overall but held up best in locally stressed months.
+- **Small caps** are the most different from J433 and the most diversified internally. Their low measured volatility is partly a liquidity effect, and their tail risk is the largest.
+
+For a manager benchmarked to the Capped SWIX, mid and small caps are the source of genuine diversification, but against local stress, not offshore uncertainty. Their measured risk should be judged on monthly rather than daily data.
+
+The main limitations are the missing sector labels for small caps, the stocks that sit in both the large- and mid-cap indexes at the same time, and the short sample of extreme months (28 per group) in the stratification.
+
+
+

@@ -1,0 +1,854 @@
+---
+title: "ABC Fund vs the Active Manager Universe"
+subtitle: "What peer returns tell us, and the case for ABC"
+author: "Happy Matope | Financial Econometrics 871, Question 3"
+date: "November 2026"
+output:
+  powerpoint_presentation:
+    slide_level: 2
+---
+
+
+```{r, include=FALSE}
+
+rm(list = ls()) # Clean your environment:
+gc() # garbage collection - It can be useful to call gc after a large object has been removed, as this may prompt R to return memory to the operating system.
+library(tidyverse)
+list.files('code/', full.names = T, recursive = T) %>% .[grepl('.R', .)] %>% as.list() %>% walk(~source(.))
+```
+
+```{r packages, include=FALSE}
+pacman::p_load(tidyverse, lubridate, tbl2xts, PerformanceAnalytics, RcppRoll, fmxdat)
+
+pct <- function(x, acc = 0.1) scales::percent(x, accuracy = acc)
+```
+
+```{r load-data, include=FALSE}
+# -------------------------------------------------------------------
+# Load data
+# -------------------------------------------------------------------
+Peers     <- read_rds("data/Active_Managers.rds")
+ABC       <- read_rds("data/ABC_Fund.rds")
+Idx_Daily <- read_rds("data/Index_Returns_Daily.rds")
+Stocks    <- read_rds("data/Stock_Returns_Daily.rds")
+Cons      <- read_rds("data/Monthly_Index_Constituents.rds")
+
+# -------------------------------------------------------------------
+# Monthly benchmark from daily J433 (Bonus 22, Step 2): compound with
+# cumprod, take the month-end value, join to funds by YearMonth (YM)
+# rather than by date (avoids 28 vs 29 Feb mismatches).
+# -------------------------------------------------------------------
+BMUse <-
+  Idx_Daily %>%
+  filter(Tickers == "J433") %>%
+  arrange(date) %>%
+  mutate(cp = cumprod(1 + Returns)) %>%
+  fmxdat::YM() %>%
+  group_by(YM) %>%
+  filter(date == dplyr::last(date)) %>%
+  ungroup() %>%
+  arrange(date) %>%
+  mutate(BM = cp / lag(cp) - 1) %>%
+  filter(!is.na(BM))       # Jan 2015 has no full-month return
+
+# All funds (peers + ABC), full history
+Funds <-
+  bind_rows(Peers, ABC) %>%
+  rename(Funds = Name) %>%
+  filter(!is.na(Returns)) %>%
+  fmxdat::YM() %>%
+  mutate(Group = ifelse(Funds == "ABC_Fund", "ABC Fund", "Peers"))
+
+# Funds joined to the benchmark (common sample: Feb 2015 - Oct 2025)
+active_df <-
+  left_join(Funds, BMUse %>% select(YM, BM), by = "YM") %>%
+  filter(!is.na(BM))
+```
+
+```{r data-table, include=FALSE}
+# Data overview for the data slide
+Fund_Life <- Peers %>% group_by(Name) %>% summarise(s = min(date), e = max(date))
+
+Tab_Data <- tibble(
+  Series = c("Active manager peers", "ABC Fund", "Benchmark: Capped SWIX (J433)",
+             "Stock returns + J433 weights"),
+  Frequency = c("Monthly", "Monthly", "Daily (compounded to monthly)", "Daily (to weekly)"),
+  Period = c(paste(format(min(Peers$date), "%b %Y"), "-", format(max(Peers$date), "%b %Y")),
+             paste(format(min(ABC$date), "%b %Y"), "-", format(max(ABC$date), "%b %Y")),
+             paste(format(min(BMUse$date), "%b %Y"), "-", format(max(BMUse$date), "%b %Y")),
+             paste(format(min(Stocks$date), "%b %Y"), "-", format(max(Stocks$date), "%b %Y"))),
+  Coverage = c(paste0(n_distinct(Peers$Name), " funds (",
+                      sum(Fund_Life$e >= max(Peers$date)), " still reporting)"),
+               paste(nrow(ABC), "months"),
+               "Used for beta, excess returns",
+               "Used for market dispersion")
+)
+```
+
+# Introduction
+
+## The four questions we answer
+
+::::: {.columns}
+::: {.column}
+**The questions**
+
+1. How much market beta do peers give clients?
+2. What drives ABC's returns vs the industry?
+3. How has ABC done against peers over time?
+4. Does ABC win when dispersion is high?
+:::
+::: {.column}
+**Short answers**
+
+1. A lot (beta 0.8–0.9). ABC has the lowest.
+2. The manager, not the market; highest alpha.
+3. Mostly top quartile; lagged the 2025 rally.
+4. No: ABC's edge is not dispersion-driven.
+:::
+:::::
+
+::: notes
+Open with the questions the audience cares about and give the answers up front. The rest of the deck shows the evidence for each.
+:::
+
+# Data
+
+## Data used
+
+::::: {.columns}
+::: {.column}
+```{r tab-data}
+knitr::kable(Tab_Data)
+```
+:::
+::: {.column}
+- Returns only, as reported by the managers; no holdings.
+- **Closed funds are kept.** Dropping them would flatter the industry (survivorship bias).
+- J433 data start in 2015, so benchmark comparisons cover Feb 2015 to Oct 2025.
+:::
+:::::
+
+::: notes
+Point out that about a third of the funds in the peer universe stopped reporting along the way. Keeping them gives a fair picture of what investors actually experienced.
+:::
+
+# Methodology
+
+## How we measure market exposure and skill
+
+- **Beta**: move per 1% market move. **β = Cov(R~fund~, R~J433~) / Var(R~J433~)**, rolling 36 months.
+- **R-squared**: share of moves explained by the market. **R² = Corr(R~fund~, R~J433~)²**
+- **Alpha**: return after market exposure. **R~fund~ = α + β·R~J433~ + ε**
+- **Different bets**: correlation of each fund's leftover return ε with the median peer's.
+
+::: notes
+Keep this light for the audience: beta = market sensitivity; R-squared = how much of the fund is just the market; alpha = what the manager added.
+:::
+
+## How we measure relative performance and dispersion
+
+- **Peer rank** (Bacon, 2011): **(n − 1) / (N − 1)**, n = ABC's position among N funds; 0% = best.
+- **Rolling returns**: 12-month and 3-year returns at every month-end.
+- **Dispersion**: **Disp = √( Σ w~i~ (R~i~ − R~J433~)² )**, Capped SWIX weights.
+- **High vs low dispersion**: above the 85th vs below the 25th percentile; Welch t-test.
+
+::: notes
+Dispersion is the "opportunity set": when stocks move very differently from each other, stock pickers have more room to win or lose.
+:::
+
+# Results
+
+```{r beta, include=FALSE}
+# -------------------------------------------------------------------
+# Q1: Rolling 36-month beta for every fund
+# beta = cov(R, BM) / var(BM) using rolling means (same OLS beta as
+# Practical 1's CAPM.beta / chart.RollingRegression, but fast for 240+ funds)
+# -------------------------------------------------------------------
+Roll_N <- 36
+
+Roll_Beta <-
+  active_df %>%
+  group_by(Funds) %>%
+  arrange(date) %>%
+  filter(n() >= Roll_N) %>%
+  mutate(
+    m_R  = roll_mean(Returns,      n = Roll_N, fill = NA, align = "right"),
+    m_B  = roll_mean(BM,           n = Roll_N, fill = NA, align = "right"),
+    m_RB = roll_mean(Returns * BM, n = Roll_N, fill = NA, align = "right"),
+    m_BB = roll_mean(BM^2,         n = Roll_N, fill = NA, align = "right"),
+    m_RR = roll_mean(Returns^2,    n = Roll_N, fill = NA, align = "right"),
+    Cov  = m_RB - m_R * m_B,
+    VarB = m_BB - m_B^2,
+    VarR = m_RR - m_R^2,
+    Beta = Cov / VarB,
+    R2   = Cov^2 / (VarB * VarR),
+    # require 36 consecutive months (no gaps in the fund's history)
+    Gap_ok = as.numeric(date - lag(date, Roll_N - 1)) < (Roll_N + 1) * 31
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(Beta), Gap_ok) %>%
+  select(date, YM, Funds, Group, Beta, R2)
+
+# Boxplot over scatter at each year-end
+Beta_YE <- Roll_Beta %>% filter(month(date) == 12 | date == max(date)) %>%
+  mutate(Year = factor(year(date)))
+
+g_beta <-
+  ggplot() +
+  geom_jitter(data = Beta_YE %>% filter(Group == "Peers"),
+              aes(Year, Beta), width = 0.2, alpha = 0.35, size = 1.5,
+              color = "grey40") +
+  geom_boxplot(data = Beta_YE %>% filter(Group == "Peers"),
+               aes(Year, Beta), alpha = 0.4, outlier.shape = NA,
+               fill = "steelblue", width = 0.5) +
+  geom_point(data = Beta_YE %>% filter(Group == "ABC Fund"),
+             aes(Year, Beta), color = "darkred", size = 4, shape = 18) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(title = "Rolling 3-year beta to the Capped SWIX",
+       subtitle = "Grey dots = peer funds; box = middle 50% of peers; red diamond = ABC Fund",
+       x = "", y = "Rolling 36-month beta",
+       caption = "Note:\nMeasured at each year-end (2025 = October). Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE)
+
+Beta_Summary <-
+  Beta_YE %>%
+  group_by(Year) %>%
+  summarise(`Peer median` = median(Beta[Group == "Peers"]),
+            `Peers above 0.9` = mean(Beta[Group == "Peers"] > 0.9),
+            `ABC beta` = Beta[Group == "ABC Fund"][1],
+            `Peers with higher beta than ABC` = mean(Beta[Group == "Peers"] > `ABC beta`))
+
+# -------------------------------------------------------------------
+# Q2: single-factor model per fund (funds with 5+ years of data)
+# -------------------------------------------------------------------
+SFM <-
+  active_df %>%
+  group_by(Funds, Group) %>%
+  filter(n() >= 60) %>%
+  summarise(Months    = n(),
+            Beta      = cov(Returns, BM) / var(BM),
+            R2        = cor(Returns, BM)^2,
+            Alpha_Ann = (1 + mean(Returns - Beta * BM))^12 - 1,
+            TE        = sd(Returns - BM) * sqrt(12),
+            .groups = "drop")
+
+# ABC vs median peer, plus ABC's percentile among peers (all as text for the slide)
+ABC_Row  <- SFM %>% filter(Group == "ABC Fund")
+Peer_SFM <- SFM %>% filter(Group == "Peers") %>%
+  summarise(across(c(Beta, R2, Alpha_Ann, TE), median))
+ABC_Pctl <- SFM %>%
+  summarise(across(c(Beta, R2, Alpha_Ann, TE),
+                   ~mean(.[Group == "Peers"] < .[Group == "ABC Fund"])))
+
+SFM_Table <- tibble(
+  Measure          = c("Beta", "R-squared", "Alpha (ann.)", "Tracking error"),
+  `ABC Fund`       = c(round(ABC_Row$Beta, 2), pct(ABC_Row$R2), pct(ABC_Row$Alpha_Ann), pct(ABC_Row$TE)),
+  `Median peer`    = c(round(Peer_SFM$Beta, 2), pct(Peer_SFM$R2), pct(Peer_SFM$Alpha_Ann), pct(Peer_SFM$TE)),
+  `ABC percentile` = pct(unlist(ABC_Pctl), 1)
+)
+
+g_drivers <-
+  SFM %>%
+  ggplot(aes(R2, Beta)) +
+  geom_point(data = . %>% filter(Group == "Peers"), alpha = 0.5,
+             color = "grey40", size = 2) +
+  geom_point(data = . %>% filter(Group == "ABC Fund"), color = "darkred",
+             size = 5, shape = 18) +
+  geom_vline(xintercept = median(SFM$R2[SFM$Group == "Peers"]), linetype = "dashed") +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(title = "What drives returns: market vs manager",
+       subtitle = "Red diamond = ABC Fund; dashed line = median peer R-squared",
+       x = "R-squared vs Capped SWIX (share explained by the market)", y = "Beta",
+       caption = "Note:\nMonthly returns, funds with 5+ years of data, 2015-2025. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE)
+
+# -------------------------------------------------------------------
+# Q2b: are ABC's bets different? Correlate market-adjusted returns
+# (residuals from R = a + b*BM) with the median peer's residual.
+# Raw active returns would mislead: all low-beta funds lag in rallies.
+# -------------------------------------------------------------------
+Resid_df <-
+  active_df %>%
+  group_by(Funds, Group) %>%
+  filter(n() >= 60) %>%
+  mutate(Resid = residuals(lm(Returns ~ BM))) %>%
+  ungroup()
+
+Industry_Resid <-
+  Resid_df %>% filter(Group == "Peers") %>%
+  group_by(YM) %>%
+  summarise(Ind_Resid = median(Resid))
+
+Resid_Corr <-
+  Resid_df %>%
+  left_join(Industry_Resid, by = "YM") %>%
+  group_by(Funds, Group) %>%
+  summarise(Corr_with_Industry = cor(Resid, Ind_Resid), .groups = "drop")
+
+ABC_Corr      <- Resid_Corr$Corr_with_Industry[Resid_Corr$Group == "ABC Fund"]
+Peer_Med_Corr <- median(Resid_Corr$Corr_with_Industry[Resid_Corr$Group == "Peers"])
+ABC_Corr_Pct  <- mean(Resid_Corr$Corr_with_Industry[Resid_Corr$Group == "Peers"] < ABC_Corr)
+
+g_xscorr <-
+  ggplot() +
+  geom_histogram(data = Resid_Corr %>% filter(Group == "Peers"),
+                 aes(Corr_with_Industry), bins = 30, fill = "steelblue", alpha = 0.7) +
+  geom_vline(data = Resid_Corr %>% filter(Group == "ABC Fund"),
+             aes(xintercept = Corr_with_Industry), color = "darkred", linewidth = 1.5) +
+  labs(title = "How similar are managers' own bets to the industry's?",
+       subtitle = "Correlation with the median peer's market-adjusted return (red line = ABC)",
+       x = "Correlation", y = "Number of funds",
+       caption = "Note:\nMarket-adjusted return = residual from a regression on the Capped SWIX. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE)
+```
+
+## Most active managers give clients mostly market beta
+
+::::: {.columns}
+::: {.column}
+```{r fig-beta, fig.width = 6.5, fig.height = 4.8}
+fmxdat::finplot(g_beta)
+```
+:::
+::: {.column}
+- The typical peer's 3-year beta sits at **about 0.8–0.9** every year.
+- **Roughly a third to a half** of peers have beta above 0.9: close to an index fund, at active fees.
+- **ABC's beta fell from 0.72 to 0.40**: by 2025 it is the lowest-beta fund in the peer group.
+:::
+:::::
+
+::: notes
+This is the boxplot-over-scatter the manager asked for. Each grey dot is a fund; the box is the middle half of the industry; the red diamond is ABC, which sits below almost every peer.
+:::
+
+## Beta at each year-end
+
+```{r tab-beta}
+knitr::kable(Beta_Summary %>% mutate(across(c(`Peers above 0.9`, `Peers with higher beta than ABC`), ~pct(., 1)),
+                                     across(c(`Peer median`, `ABC beta`), ~round(., 2))))
+```
+
+## ABC's returns are driven by the manager, not the market
+
+::::: {.columns}
+::: {.column}
+```{r fig-drivers, fig.width = 6.5, fig.height = 4.8}
+fmxdat::finplot(g_drivers, x.pct = TRUE, x.pct_acc = 1)
+```
+:::
+::: {.column}
+```{r tab-sfm}
+knitr::kable(SFM_Table)
+```
+:::
+:::::
+
+::: notes
+The market explains about 82% of the typical peer's moves, but only about 55% of ABC's, and ABC has the highest alpha in the peer group (99th percentile). Alpha here is the return left after removing market exposure, Feb 2015 to Oct 2025. ABC's tracking error is high (90th percentile), which is the price of being different from the index.
+:::
+
+## But ABC's own bets lean the same way as the industry's
+
+::::: {.columns}
+::: {.column}
+```{r fig-xscorr, fig.width = 6.5, fig.height = 4.8}
+fmxdat::finplot(g_xscorr)
+```
+:::
+::: {.column}
+- After removing market exposure, ABC's returns correlate **`r round(ABC_Corr, 2)`** with the industry's, against **`r round(Peer_Med_Corr, 2)`** for the median peer.
+- ABC's bets are slightly *more* industry-like than average (`r pct(ABC_Corr_Pct, 1)` of peers are less similar).
+- **ABC is different in how much market risk it takes and how well its bets pay off, not in what it bets on.**
+:::
+:::::
+
+::: notes
+Be careful with the "contrarian" message: the data do not support it. The honest pitch is low beta plus strong stock selection.
+:::
+
+```{r performance, include=FALSE}
+# -------------------------------------------------------------------
+# Q3: Rolling returns per fund (Bonus 22): 12 and 36 months
+# (ranking vs peers needs no benchmark, so uses ABC's full history)
+# -------------------------------------------------------------------
+Roll_Fn <- function(df, N) {
+  df %>%
+    group_by(Funds) %>% arrange(date) %>%
+    mutate(RollRet = RcppRoll::roll_prod(1 + Returns, n = N, fill = NA,
+                                         align = "right")^(12 / max(N, 12)) - 1,
+           Gap_ok = as.numeric(date - lag(date, N - 1)) < (N + 1) * 31) %>%
+    ungroup() %>%
+    filter(!is.na(RollRet), Gap_ok) %>%
+    mutate(Window = paste0(N, "m"))
+}
+
+Roll <- bind_rows(Roll_Fn(Funds, 12), Roll_Fn(Funds, 36))
+
+# Percentile rank vs peers (Bacon, 2011): (n - 1) / (N - 1), 0% = best
+Ranks <-
+  Roll %>%
+  group_by(Window, date) %>%
+  filter(any(Group == "ABC Fund")) %>%
+  mutate(n_rank = rank(-RollRet, ties.method = "average"),
+         N = n(),
+         Pct_Rank = (n_rank - 1) / (N - 1)) %>%
+  ungroup() %>%
+  filter(Group == "ABC Fund") %>%
+  mutate(Quartile = case_when(Pct_Rank <= 0.25 ~ "1st",
+                              Pct_Rank <= 0.50 ~ "2nd",
+                              Pct_Rank <= 0.75 ~ "3rd",
+                              TRUE ~ "4th"))
+
+Quartile_Table <-
+  Ranks %>%
+  count(Window, Quartile) %>%
+  group_by(Window) %>% mutate(Share = pct(n / sum(n), 1)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = Quartile, values_from = Share) %>%
+  mutate(Window = recode(Window, `12m` = "Rolling 12-month", `36m` = "Rolling 3-year"))
+
+g_rank <-
+  Ranks %>%
+  mutate(Window = recode(Window, `12m` = "Rolling 12-month", `36m` = "Rolling 3-year")) %>%
+  ggplot() +
+  annotate("rect", xmin = min(Ranks$date), xmax = max(Ranks$date), ymin = 0,    ymax = 0.25, alpha = 0.15, fill = "darkgreen") +
+  annotate("rect", xmin = min(Ranks$date), xmax = max(Ranks$date), ymin = 0.75, ymax = 1,    alpha = 0.15, fill = "darkred") +
+  geom_line(aes(date, Pct_Rank, color = Window), linewidth = 1.1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  scale_y_reverse(labels = scales::percent) +
+  labs(title = "ABC Fund's percentile rank among peers",
+       subtitle = "Top of chart = best; green band = 1st quartile, red band = 4th quartile",
+       x = "", y = "Percentile rank (0% = best)", color = "",
+       caption = "Note:\nPercentile rank = (rank - 1) / (N - 1), Bacon (2011). Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+
+# "Football field": peer distribution of rolling 3-year returns over time
+BM_Roll36 <-
+  BMUse %>% arrange(date) %>%
+  mutate(RollRet = RcppRoll::roll_prod(1 + BM, n = 36, fill = NA,
+                                       align = "right")^(12 / 36) - 1) %>%
+  filter(!is.na(RollRet)) %>% select(YM, BM_Roll = RollRet)
+
+Field <-
+  Roll %>% filter(Window == "36m", Group == "Peers") %>%
+  group_by(YM, date) %>%
+  summarise(P05 = quantile(RollRet, 0.05), P25 = quantile(RollRet, 0.25),
+            P50 = median(RollRet),         P75 = quantile(RollRet, 0.75),
+            P95 = quantile(RollRet, 0.95), .groups = "drop") %>%
+  left_join(Roll %>% filter(Window == "36m", Group == "ABC Fund") %>%
+              select(YM, ABC = RollRet), by = "YM") %>%
+  left_join(BM_Roll36, by = "YM") %>%
+  filter(!is.na(ABC))
+
+g_field <-
+  Field %>%
+  ggplot(aes(x = date)) +
+  geom_ribbon(aes(ymin = P05, ymax = P95), fill = "steelblue", alpha = 0.2) +
+  geom_ribbon(aes(ymin = P25, ymax = P75), fill = "steelblue", alpha = 0.45) +
+  geom_line(aes(y = P50, color = "Median peer"), linewidth = 0.9) +
+  geom_line(aes(y = BM_Roll, color = "Capped SWIX"), linewidth = 0.9, linetype = "dashed") +
+  geom_line(aes(y = ABC, color = "ABC Fund"), linewidth = 1.4) +
+  scale_color_manual(values = c("ABC Fund" = "darkred", "Median peer" = "navy",
+                                "Capped SWIX" = "black")) +
+  labs(title = "Rolling 3-year annualised returns: ABC vs the peer group",
+       subtitle = "Dark band = middle 50% of peers; light band = 5th to 95th percentile",
+       x = "", y = "Annualised 3-year return", color = "",
+       caption = "Note:\nCapped SWIX shown from 2018 (data start 2015). Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE)
+
+# Growth of R1: ABC vs median peer vs Capped SWIX (from Feb 2015)
+Peer_Med <-
+  Funds %>% filter(Group == "Peers") %>%
+  group_by(YM) %>% summarise(Peer_Median = median(Returns))
+
+Compare <-
+  Funds %>% filter(Group == "ABC Fund") %>% select(date, YM, ABC = Returns) %>%
+  left_join(Peer_Med, by = "YM") %>%
+  inner_join(BMUse %>% select(YM, J433 = BM), by = "YM") %>%
+  pivot_longer(c(ABC, Peer_Median, J433), names_to = "Tickers", values_to = "Ret")
+
+g_cum <-
+  Compare %>%
+  group_by(Tickers) %>% arrange(date) %>%
+  mutate(Cum = cumprod(1 + Ret)) %>% ungroup() %>%
+  ggplot() +
+  geom_line(aes(date, Cum, color = Tickers), linewidth = 1.1) +
+  labs(title = "Growth of R1: ABC Fund vs median peer vs Capped SWIX",
+       x = "", y = "Value of R1 invested", color = "",
+       caption = "Note:\nMonthly returns from Feb 2015. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+
+# Statistics table (Bonus 12: Moments_Comp)
+Moments_Comp <- function(funds, BM, Yrs_LookBack) {
+
+  funds_considered <-
+    funds %>% filter(date >= fmxdat::safe_year_min(datesel = dplyr::last(date),
+                                                    N = Yrs_LookBack))
+  Fundxts <- funds_considered %>%
+    tbl_xts(cols_to_xts = Ret, spread_by = Tickers, Colnames_Exact = TRUE)
+  BMxts   <- funds_considered %>% filter(Tickers == BM) %>%
+    tbl_xts(cols_to_xts = Ret, Colnames_Exact = TRUE)
+
+  one_row <- function(x) {
+    x <- as.matrix(x); if (nrow(x) > 1) x <- t(x)
+    out <- data.frame(x); colnames(out) <- colnames(Fundxts); out
+  }
+
+  bind_rows(
+    one_row(Return.annualized(Fundxts, scale = 12, geometric = TRUE)),
+    one_row(sd.annualized(Fundxts, scale = 12, geometric = TRUE)),
+    one_row(AdjustedSharpeRatio(Fundxts)),
+    one_row(maxDrawdown(Fundxts)),
+    one_row(InformationRatio(Ra = Fundxts, Rb = BMxts)),
+    one_row(UpDownRatios(Ra = Fundxts, Rb = BMxts, method = "Capture", side = "Up")),
+    one_row(UpDownRatios(Ra = Fundxts, Rb = BMxts, method = "Capture", side = "Down"))
+  ) %>%
+    mutate(Period = glue::glue("Last {Yrs_LookBack} years"),
+           Info = c("Return (ann.)", "Volatility (ann.)", "Adj. Sharpe ratio",
+                    "Max drawdown", "Information ratio", "Up capture", "Down capture")) %>%
+    relocate(Period, Info) %>% as_tibble()
+}
+
+Stats_Fmt <- function(df) {
+  df %>%
+    mutate(across(c(ABC, Peer_Median, J433),
+                  ~ifelse(is.nan(.) | is.na(.), "-",
+                   ifelse(Info %in% c("Return (ann.)", "Volatility (ann.)", "Max drawdown"),
+                          pct(.), sprintf("%.2f", .))))) %>%
+    select(Info, `ABC Fund` = ABC, `Median peer` = Peer_Median, `Capped SWIX` = J433)
+}
+Tab_10y <- Moments_Comp(Compare, BM = "J433", Yrs_LookBack = 10) %>% Stats_Fmt()
+Tab_3y  <- Moments_Comp(Compare, BM = "J433", Yrs_LookBack = 3)  %>% Stats_Fmt()
+
+# Bonus 22: share of 12-month windows beating the Capped SWIX
+Beat <-
+  Roll %>% filter(Window == "12m") %>%
+  inner_join(BMUse %>% arrange(date) %>%
+               mutate(RollBM = RcppRoll::roll_prod(1 + BM, n = 12, fill = NA,
+                                                   align = "right") - 1) %>%
+               select(YM, RollBM), by = "YM") %>%
+  filter(!is.na(RollBM)) %>%
+  mutate(XS = RollRet - RollBM) %>%
+  group_by(Group) %>%
+  summarise(Beat = mean(XS > 0))
+```
+
+## ABC has spent most of the cycle in the top quartile
+
+::::: {.columns}
+::: {.column}
+```{r fig-field, fig.width = 6.5, fig.height = 4.8}
+fmxdat::finplot(g_field, x.date.dist = "1 year", x.date.type = "%Y",
+                x.vert = TRUE, y.pct = TRUE, y.pct_acc = 1)
+```
+:::
+::: {.column}
+- ABC's 3-year return sat **above the middle half of peers** in 2015–16 and again in 2020–22.
+- Over rolling 12 months, ABC beat the Capped SWIX in **`r pct(Beat$Beat[Beat$Group == "ABC Fund"], 1)`** of months, against **`r pct(Beat$Beat[Beat$Group == "Peers"], 1)`** for the average peer.
+- 2025 is the exception: in a sharp rally, low beta held ABC back.
+:::
+:::::
+
+::: notes
+This is the "creative" relative-performance visual: the blue bands show the whole industry, so the audience sees where ABC sits each month rather than against a single average.
+:::
+
+## ABC's 3-year rank: top quartile 70% of the time
+
+::::: {.columns}
+::: {.column}
+```{r fig-rank, fig.width = 6.5, fig.height = 4.8}
+fmxdat::finplot(g_rank, x.date.dist = "1 year", x.date.type = "%Y", x.vert = TRUE)
+```
+:::
+::: {.column}
+```{r tab-quart}
+knitr::kable(Quartile_Table %>% rename(`Share of months in quartile:` = Window))
+```
+:::
+:::::
+
+::: notes
+On 3-year returns ABC was in the top quartile about 70% of the time and in the bottom quartile almost never, until 2025.
+:::
+
+## Last 10 years: more return, less risk than peers and the market
+
+::::: {.columns}
+::: {.column}
+```{r fig-cum, fig.width = 6.5, fig.height = 4.8}
+fmxdat::finplot(g_cum, x.date.dist = "1 year", x.date.type = "%Y", x.vert = TRUE)
+```
+:::
+::: {.column}
+```{r tab-10y}
+knitr::kable(Tab_10y)
+```
+:::
+:::::
+
+::: notes
+Headline: about 3% a year more than the market with a third less volatility, and less than half the drawdown. Down capture of about 0.6 means ABC lost roughly 60% of what the market lost in down months.
+:::
+
+## Last 3 years: the cost of low beta in a strong rally
+
+::::: {.columns}
+::: {.column}
+```{r tab-3y}
+knitr::kable(Tab_3y)
+```
+:::
+::: {.column}
+- ABC trailed the market: it captured **less than half** of the rally (up capture about 0.46).
+- It lost only about **a quarter** of the market's falls (down capture about 0.27), with the best risk-adjusted return.
+- **The trade-off clients buy:** protection in sell-offs, at the cost of lagging sharp bull runs.
+:::
+:::::
+
+::: notes
+Expect this question from the audience. Answer it directly: the 2025 underperformance is the flip side of the downside protection, not a change in skill.
+:::
+
+```{r dispersion, include=FALSE}
+# -------------------------------------------------------------------
+# Q4: Market dispersion (Bonus 22: Dispersion_Prep, weekly, +-50% winsor)
+# -------------------------------------------------------------------
+YM_num <- function(x) format(x, "%Y%m")   # numeric year-month key (for weights)
+
+Weekly <-
+  Stocks %>%
+  arrange(date) %>%
+  mutate(Returns = ifelse(Returns >  0.5,  0.5,
+                   ifelse(Returns < -0.5, -0.5, Returns)),
+         YW = format(date, "%Y%W")) %>%
+  group_by(Tickers, YW) %>%
+  summarise(date = dplyr::last(date), Return = prod(1 + Returns) - 1,
+            .groups = "drop") %>%
+  group_by(YW) %>% mutate(date = max(date)) %>% ungroup()
+
+# Each week uses the J433 weights from the PREVIOUS month-end
+BM_W <-
+  Cons %>% filter(Fund == "CappedSWIX") %>%
+  transmute(W_YM = YM_num(date), Tickers, Wt = Weight)
+
+df_stocks <-
+  Weekly %>%
+  mutate(W_YM = YM_num(floor_date(date, "month") - days(1))) %>%
+  inner_join(BM_W, by = c("W_YM", "Tickers")) %>%
+  select(date, Tickers, Return, Wt)
+
+BM_Weekly <-
+  Idx_Daily %>% filter(Tickers == "J433") %>%
+  mutate(YW = format(date, "%Y%W")) %>%
+  group_by(YW) %>%
+  summarise(BM = prod(1 + Returns) - 1, .groups = "drop") %>%
+  inner_join(Weekly %>% distinct(YW, date), by = "YW") %>%
+  select(date, BM)
+
+# Weighted CSV = sqrt( sum_i w_i (R_i - R_BM)^2 ) over rolling NSel weeks
+Dispersion_Prep <- function(df_used, BMUse, NSel = 12, CapDisp = 0.45) {
+  df_used %>%
+    group_by(Tickers) %>%
+    arrange(date) %>%
+    mutate(roll_Rt = RcppRoll::roll_prod(1 + Return, n = NSel, fill = NA,
+                                         align = "right") - 1,
+           roll_wt = RcppRoll::roll_mean(Wt, n = NSel, fill = NA,
+                                         align = "right")) %>%
+    ungroup() %>%
+    left_join(BMUse %>% arrange(date) %>%
+                mutate(roll_BM = RcppRoll::roll_prod(1 + BM, n = NSel, fill = NA,
+                                                     align = "right") - 1) %>%
+                select(date, roll_BM),
+              by = "date") %>%
+    filter(!is.na(roll_Rt), !is.na(roll_wt), !is.na(roll_BM)) %>%
+    group_by(date) %>%
+    mutate(roll_wt = roll_wt / sum(roll_wt),
+           Idx_U   = mean(roll_Rt)) %>%
+    summarise(Dispersion_U = sqrt(mean((roll_Rt - Idx_U)^2)),
+              Dispersion_W = sqrt(sum(roll_wt * (roll_Rt - roll_BM)^2)),
+              N = n(), .groups = "drop") %>%
+    mutate(N_weeks = NSel,
+           across(starts_with("Disp"), ~ifelse(. > CapDisp, CapDisp, .)))
+}
+
+Disp_52w <- Dispersion_Prep(df_stocks, BM_Weekly, NSel = 52)   # ~12 months
+Disp_4w  <- Dispersion_Prep(df_stocks, BM_Weekly, NSel = 4)    # ~1 month
+
+# Month-end values, keyed with fmxdat::YM() to match the fund data
+Month_End <- function(d) d %>% fmxdat::YM() %>% group_by(YM) %>%
+  filter(date == max(date)) %>% ungroup() %>% select(YM, Disp = Dispersion_W)
+
+Disp_M52 <- Month_End(Disp_52w)
+Disp_M4  <- Month_End(Disp_4w)
+
+# Stratify: High > 85th percentile, Low < 25th percentile (Bonus 22)
+Strat_Fn <- function(df, hi = 0.85, lo = 0.25) {
+  df %>%
+    filter(!is.na(Disp)) %>%
+    mutate(hidisp = quantile(Disp, hi), lodisp = quantile(Disp, lo)) %>%
+    mutate(Enviro = ifelse(Disp > hidisp, "High dispersion",
+                    ifelse(Disp < lodisp, "Low dispersion", "Other")))
+}
+
+# (a) Bonus 22 replication: rolling 12-month relative performance
+df_comp <-
+  active_df %>%
+  group_by(Funds) %>% arrange(date) %>%
+  mutate(RollRet = RcppRoll::roll_prod(1 + Returns, n = 12, fill = NA, align = "right"),
+         RollBM  = RcppRoll::roll_prod(1 + BM,      n = 12, fill = NA, align = "right")) %>%
+  ungroup() %>%
+  filter(!is.na(RollRet)) %>%
+  mutate(XS = RollRet - RollBM) %>%
+  group_by(YM, date) %>%
+  filter(any(Group == "ABC Fund")) %>%
+  summarise(Proportion  = sum(XS[Group == "Peers"] > 0) / sum(Group == "Peers"),
+            Peer_Med_XS = median(XS[Group == "Peers"]),
+            ABC_XS      = XS[Group == "ABC Fund"],
+            .groups = "drop")
+
+Roll12_Strat <- left_join(df_comp, Disp_M52, by = "YM") %>% Strat_Fn()
+
+Roll12_Table <-
+  Roll12_Strat %>%
+  mutate(Enviro = recode(Enviro, `High dispersion` = "High", `Low dispersion` = "Low"),
+         Enviro = factor(Enviro, levels = c("High", "Other", "Low"))) %>%
+  group_by(Dispersion = Enviro) %>%
+  summarise(Months = n(),
+            `ABC beat J433` = pct(mean(ABC_XS > 0), 1),     # before ABC_XS is averaged
+            `ABC excess` = pct(mean(ABC_XS)),
+            `Peer excess` = pct(mean(Peer_Med_XS)),
+            `Peers beat J433` = pct(mean(Proportion), 1))
+
+# (b) Non-overlapping monthly test: each month counts once
+Monthly <-
+  active_df %>%
+  group_by(YM, date) %>%
+  filter(any(Group == "ABC Fund")) %>%
+  summarise(ABC_XS_BM    = Returns[Group == "ABC Fund"] - BM[1],
+            ABC_XS_Peers = Returns[Group == "ABC Fund"] - median(Returns[Group == "Peers"]),
+            ABC_Distance = abs(Returns[Group == "ABC Fund"] - median(Returns[Group == "Peers"])),
+            .groups = "drop") %>%
+  left_join(Disp_M4, by = "YM") %>%
+  Strat_Fn()
+
+Hi <- Monthly %>% filter(Enviro == "High dispersion")
+Lo <- Monthly %>% filter(Enviro == "Low dispersion")
+
+Test_Table <- tibble(
+  Measure = c("ABC minus J433 (per month)", "ABC minus median peer (per month)",
+              "Months ABC beat median peer", "ABC's distance from median peer"),
+  `High` = c(pct(mean(Hi$ABC_XS_BM), 0.01), pct(mean(Hi$ABC_XS_Peers), 0.01),
+                        pct(mean(Hi$ABC_XS_Peers > 0), 1), pct(mean(Hi$ABC_Distance), 0.1)),
+  `Low`  = c(pct(mean(Lo$ABC_XS_BM), 0.01), pct(mean(Lo$ABC_XS_Peers), 0.01),
+                        pct(mean(Lo$ABC_XS_Peers > 0), 1), pct(mean(Lo$ABC_Distance), 0.1)),
+  `p-value` = c(format(round(t.test(Hi$ABC_XS_BM, Lo$ABC_XS_BM)$p.value, 2), nsmall = 2),
+                format(round(t.test(Hi$ABC_XS_Peers, Lo$ABC_XS_Peers)$p.value, 2), nsmall = 2),
+                "-",
+                format(round(t.test(Hi$ABC_Distance, Lo$ABC_Distance)$p.value, 3), nsmall = 3))
+)
+
+# Regression across all months: does ABC's edge rise with dispersion?
+Disp_Reg <- summary(lm(ABC_XS_Peers ~ Disp, data = Monthly))$coefficients
+
+g_disp_scatter <-
+  Monthly %>%
+  ggplot(aes(Disp, ABC_XS_Peers)) +
+  geom_point(aes(color = Enviro), size = 2.2, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("High dispersion" = "darkred", "Other" = "grey60",
+                                "Low dispersion" = "steelblue")) +
+  labs(title = "Does ABC beat its peers when stock dispersion is high?",
+       subtitle = "Each dot = one month; y = ABC's return minus the median peer's",
+       x = "Monthly stock dispersion (Capped SWIX constituents)",
+       y = "ABC minus median peer", color = "",
+       caption = "Note:\nHigh = above 85th percentile, Low = below 25th. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE)
+```
+
+## Testing the claim: "high dispersion rewards my fund"
+
+::::: {.columns}
+::: {.column}
+```{r fig-disp, fig.width = 6.5, fig.height = 4.8}
+fmxdat::finplot(g_disp_scatter, x.pct = TRUE, x.pct_acc = 1, y.pct = TRUE, y.pct_acc = 1)
+```
+:::
+::: {.column}
+- If the claim held, the dots would slope **upwards**. The line is flat to slightly down (slope $p$ = `r round(Disp_Reg["Disp", 4], 2)`).
+- ABC **does move further from the crowd** when dispersion is high, but those bets have gone both ways.
+:::
+:::::
+
+::: notes
+This is the honest test of the manager's claim. Better to adjust the message now than to be challenged on it at the conference.
+:::
+
+## Rolling 12 months: ABC does best in normal, not high-dispersion, periods
+
+::::: {.columns}
+::: {.column}
+```{r tab-roll12}
+knitr::kable(Roll12_Table)
+```
+:::
+::: {.column}
+- High dispersion is a hard environment for **all** managers (fewer beat J433).
+- ABC still beats peers there, but its best results come in "other" months.
+:::
+:::::
+
+## Month by month: no significant dispersion effect
+
+::::: {.columns}
+::: {.column}
+```{r tab-test}
+knitr::kable(Test_Table)
+```
+:::
+::: {.column}
+- In high-dispersion months ABC trailed both J433 and the median peer on average.
+- Neither difference is statistically significant.
+- ABC **does** move further from the crowd when dispersion is high; those bets just haven't paid off.
+:::
+:::::
+
+::: notes
+Only about 20 months count as high dispersion, so the test has limited power, but nothing points in the direction of the claim.
+:::
+
+# Summary
+
+## The case for including ABC in client portfolios
+
+::::: {.columns}
+::: {.column}
+**What the evidence supports**
+
+- **Not a closet index fund:** lowest beta in the peer group.
+- **Real skill:** highest alpha; top-quartile 3-year returns 70% of the time.
+- **Capital protection:** half the market's drawdown.
+:::
+::: {.column}
+**What to say carefully**
+
+- **Not a contrarian or high-dispersion fund:** its bets resemble the industry's.
+- **It will lag sharp rallies**, as in 2025.
+- **Position it as** a core defensive-alpha holding alongside higher-beta funds.
+:::
+:::::
+
+::: notes
+Close with the positioning: ABC complements the industry's high-beta funds rather than duplicating them.
+:::
+
+## Notes on the analysis
+
+- Peer and ABC returns as provided (monthly); Capped SWIX from the daily index series. Comparisons with the benchmark cover Feb 2015 to Oct 2025.
+- Closed funds are included in all peer statistics.
+- Rolling windows overlap, so formal tests use non-overlapping monthly data.
+- References: Bacon, C. R. (2011). *Practical Portfolio Performance Measurement and Attribution*. Wiley. Course practicals on stratification and dispersion of active managers.

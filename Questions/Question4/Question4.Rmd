@@ -1,0 +1,915 @@
+---
+title: "QUESTION_4"
+subtitle: "Building a Constrained Global Balanced Index Fund"
+documentclass: "elsarticle"
+Thesis_FP: FALSE
+AddTitle: TRUE
+Author1: "Happy Matope"
+Ref1: "Stellenbosch University, South Africa"
+Email1: "your-student-number\\@sun.ac.za"
+keywords: "Portfolio optimisation \\sep Minimum variance \\sep Ledoit-Wolf shrinkage \\sep Quarterly rebalancing \\sep Backtesting"
+JELCodes: "G11 \\sep C61"
+BottomRFooter: "\\footnotesize Page \\thepage"
+addtoprule: TRUE
+addfootrule: TRUE
+margin: 2.3
+bottom: 2
+top: 2.5
+HardSet_layout: TRUE
+linenumbers: FALSE
+bibliography: Tex/ref.bib
+csl: Tex/harvard-stellenbosch-university.csl
+RemovePreprintSubmittedTo: TRUE
+toc: FALSE
+numbersections: TRUE
+fontsize: 11pt
+linestretch: 1.2
+link-citations: TRUE
+output:
+  pdf_document:
+    keep_tex: TRUE
+    template: Tex/TexDefault.txt
+    fig_width: 3.5
+    fig_height: 3.5
+
+---
+\makeatletter
+\@ifundefined{pandocbounded}{%
+  \newsavebox\pandoc@box
+  \newcommand*\pandocbounded[1]{%
+    \sbox\pandoc@box{#1}%
+    \Gscale@div\@tempa{\textheight}{\dimexpr\ht\pandoc@box+\dp\pandoc@box\relax}%
+    \Gscale@div\@tempb{\linewidth}{\wd\pandoc@box}%
+    \ifdim\@tempb\p@<\@tempa\p@\let\@tempa\@tempb\fi
+    \ifdim\@tempa\p@<\p@\scalebox{\@tempa}{\usebox\pandoc@box}%
+    \else\usebox{\pandoc@box}\fi}%
+}{}
+\makeatother
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4, fig.pos = "H")
+if (!dir.exists("data")) knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r packages, include=FALSE}
+pacman::p_load(tidyverse, lubridate, tbl2xts, PerformanceAnalytics, rmsfuns,
+               fmxdat, xts, quadprog, RiskPortfolios, Matrix, xtable)
+
+# Helper for LaTeX tables (Texevier convention: xtable + results = 'asis')
+tab_print <- function(df, caption, label, digits = 3, size = "\\footnotesize") {
+  print(xtable::xtable(df, caption = caption, label = label, digits = digits),
+        include.rownames = FALSE, comment = FALSE,
+        table.placement = "!htbp", caption.placement = "top", size = size)
+}
+```
+
+# Introduction \label{Introduction}
+
+A balanced index fund aims to deliver steady, diversified growth at a moderate level of risk. Building one is a constrained optimisation problem: the manager must decide how much to hold in each asset while respecting the mandate's limits. Here the fund must be long-only, rebalanced quarterly, and hold at most 35% in any single asset, 75% in equities, 25% in bonds and credit, 15% in commodities and 60% offshore. Covariance and mean estimates must use at least ten years of data, and no asset may be held with less than five years of returns.
+
+This report asks two questions:
+
+1. What do optimised portfolios that satisfy every constraint look like, and which constraints bind?
+2. Do they improve on a simple rules-based balanced portfolio out of sample?
+
+Two optimisers are used, following the course's portfolio-optimisation practicals: minimum variance and maximum Sharpe ratio. Both are compared with a fixed-weight balanced portfolio.
+
+Section \ref{Data} describes the data, Section \ref{Method} the methods, Section \ref{Results} the results, and Section \ref{Summary} summarises.
+
+# Data \label{Data}
+
+```{r load-data, include=FALSE}
+# -------------------------------------------------------------------
+# Load data
+# Note: MAA.rds / MAA.jpg / msci.txt referred to in the paper are not in
+# the data folder, so the universe is built from the files listed in the
+# question's code chunks.
+# -------------------------------------------------------------------
+MSCI        <- read_rds("data/MSCI_Indexes.rds")
+Bond_Yields <- read_rds("data/Global_Bond_Yields.rds")
+Commods     <- read_rds("data/Commodities.rds")
+LCL_Yield   <- read_rds("data/Monthly_LCL_Yield_Indexes.rds")
+Idx_Daily   <- read_rds("data/Index_Returns_Daily.rds")
+
+# Month-end helper: last available value in each month (Bonus 22 style)
+Month_End <- function(df) {
+  df %>% fmxdat::YM() %>% group_by(Tickers, YM) %>%
+    filter(date == max(date)) %>% ungroup()
+}
+```
+
+```{r build-universe, include=FALSE}
+# -------------------------------------------------------------------
+# Global equity: four non-overlapping MSCI regions (USD total return)
+# (World / ACWI overlap with these and would make the covariance matrix
+#  near-singular)
+# -------------------------------------------------------------------
+MSCI_M <-
+  MSCI %>%
+  filter(Name %in% c("MSCI_USA", "MSCI_EU", "MSCI_Jap", "MSCI_EM")) %>%
+  transmute(date, Tickers = Name, TRI) %>%
+  Month_End() %>%
+  group_by(Tickers) %>% arrange(date) %>%
+  mutate(Returns = TRI / lag(TRI) - 1) %>% ungroup()
+
+# -------------------------------------------------------------------
+# Commodities: Bloomberg Commodity index and gold.
+# Brent (CO1) is a front-month futures PRICE, not an investable total
+# return (ignores roll costs), so it is excluded.
+# -------------------------------------------------------------------
+Commod_M <-
+  Commods %>%
+  filter(Name %in% c("Bcom_Index", "Gold")) %>%
+  transmute(date, Tickers = Name, TRI) %>%
+  Month_End() %>%
+  group_by(Tickers) %>% arrange(date) %>%
+  mutate(Returns = TRI / lag(TRI) - 1) %>% ungroup()
+
+# -------------------------------------------------------------------
+# Global bonds: total-return proxy from 10-year yields (own method).
+# Buy a 10-year PAR bond at month-end t-1 (coupon = y_{t-1}), re-price it
+# at y_t, add one month of coupon. Captures duration AND convexity, and
+# works for negative yields.
+# -------------------------------------------------------------------
+Bond_Price <- function(y, c, n = 20) {
+  k <- 1:n
+  sum((c / 2) / (1 + y / 2)^k) + 1 / (1 + y / 2)^n
+}
+
+Bond_M <-
+  Bond_Yields %>%
+  filter(Name %in% c("US_10Yr", "EURO_10Yr")) %>%
+  transmute(date, Tickers = Name, Yield = TRI / 100) %>%
+  Month_End() %>%
+  group_by(Tickers) %>% arrange(date) %>%
+  mutate(y_prev = lag(Yield)) %>%
+  filter(!is.na(y_prev)) %>%
+  rowwise() %>%
+  mutate(Returns = Bond_Price(Yield, c = y_prev) - 1 + y_prev / 12) %>%
+  ungroup() %>%
+  select(date, YM, Tickers, Returns)
+
+# -------------------------------------------------------------------
+# Local assets
+# (a) yield proxies (monthly total returns): ALBI, CILI, listed property
+# -------------------------------------------------------------------
+LCL_M <-
+  LCL_Yield %>%
+  mutate(Tickers = recode(Tickers, ALBITR = "ALBI", CILITR = "CILI",
+                          J253 = "SA_Property")) %>%
+  fmxdat::YM() %>%
+  select(date, YM, Tickers, Returns)
+
+# (b) local equity: Large (J200), Mid (J201) and two factor indexes.
+#     Low Vol starts in 2024 (< 5 years), so Momentum and Value are used.
+LCL_Eq_M <-
+  Idx_Daily %>%
+  filter(Tickers %in% c("J200", "J201", "STXMOMJ433", "STXVALJ433")) %>%
+  mutate(Tickers = recode(Tickers, J200 = "SA_Large", J201 = "SA_Mid",
+                          STXMOMJ433 = "SA_Momentum", STXVALJ433 = "SA_Value")) %>%
+  fmxdat::YM() %>%
+  group_by(Tickers, YM) %>%
+  summarise(date = max(date), Returns = prod(1 + Returns) - 1,
+            N_days = n(), .groups = "drop") %>%
+  group_by(Tickers) %>% arrange(date) %>%
+  filter(!(row_number() == 1 & N_days < 15)) %>%      # drop partial first month
+  ungroup() %>% select(-N_days)
+
+# -------------------------------------------------------------------
+# Classification for the mandate
+# -------------------------------------------------------------------
+Asset_Info <- tribble(
+  ~Tickers,       ~Class,        ~Region,
+  "MSCI_USA",     "Equity",      "Global",
+  "MSCI_EU",      "Equity",      "Global",
+  "MSCI_Jap",     "Equity",      "Global",
+  "MSCI_EM",      "Equity",      "Global",
+  "SA_Large",     "Equity",      "Local",
+  "SA_Mid",       "Equity",      "Local",
+  "SA_Momentum",  "Equity",      "Local",
+  "SA_Value",     "Equity",      "Local",
+  "SA_Property",  "Equity",      "Local",   # listed property: equity risk
+  "US_10Yr",      "Bond",        "Global",
+  "EURO_10Yr",    "Bond",        "Global",
+  "ALBI",         "Bond",        "Local",
+  "CILI",         "Bond",        "Local",
+  "Bcom_Index",   "Commodity",   "Global",
+  "Gold",         "Commodity",   "Global"
+)
+
+# One monthly panel, common month-end date per YearMonth, from Jan 2010
+Monthly <-
+  bind_rows(MSCI_M %>% select(YM, Tickers, Returns),
+            Commod_M %>% select(YM, Tickers, Returns),
+            Bond_M %>% select(YM, Tickers, Returns),
+            LCL_M %>% select(YM, Tickers, Returns),
+            LCL_Eq_M %>% select(YM, Tickers, Returns)) %>%
+  filter(!is.na(Returns)) %>%
+  mutate(date = ceiling_date(as.Date(paste0(YM, "01"), format = "%Y%B%d"),
+                             "month") - days(1)) %>%
+  filter(date >= ymd(20100131), date <= ymd(20260930)) %>%
+  left_join(Asset_Info, by = "Tickers") %>%
+  arrange(Tickers, date)
+```
+
+```{r data-tables, include=FALSE}
+Source_Info <- tribble(
+  ~Tickers,      ~Description,                          ~Source,
+  "MSCI_USA",    "MSCI USA (USD TR)",                   "MSCI_Indexes",
+  "MSCI_EU",     "MSCI Europe (USD TR)",                "MSCI_Indexes",
+  "MSCI_Jap",    "MSCI Japan (USD TR)",                 "MSCI_Indexes",
+  "MSCI_EM",     "MSCI Emerging Markets (USD TR)",      "MSCI_Indexes",
+  "SA_Large",    "JSE Top 40 / Large caps (J200)",      "Index_Returns_Daily",
+  "SA_Mid",      "JSE Mid caps (J201)",                 "Index_Returns_Daily",
+  "SA_Momentum", "Momentum factor index (STXMOMJ433)",  "Index_Returns_Daily",
+  "SA_Value",    "Value factor index (STXVALJ433)",     "Index_Returns_Daily",
+  "SA_Property", "Listed property (J253)",              "Monthly_LCL_Yield_Indexes",
+  "US_10Yr",     "US 10-year bond (proxy from yields)", "Global_Bond_Yields",
+  "EURO_10Yr",   "Euro 10-year bond (proxy from yields)", "Global_Bond_Yields",
+  "ALBI",        "All Bond Index",                      "Monthly_LCL_Yield_Indexes",
+  "CILI",        "Inflation-linked bond index",         "Monthly_LCL_Yield_Indexes",
+  "Bcom_Index",  "Bloomberg Commodity index",           "Commodities",
+  "Gold",        "Gold",                                "Commodities"
+)
+
+Tab_Assets <-
+  Monthly %>% group_by(Tickers) %>%
+  summarise(Start = format(min(date), "%b %Y"), End = format(max(date), "%b %Y"),
+            Years = round(n() / 12, 1)) %>%
+  left_join(Asset_Info, by = "Tickers") %>%
+  left_join(Source_Info, by = "Tickers") %>%
+  mutate(Tickers = factor(Tickers, levels = Asset_Info$Tickers)) %>%
+  arrange(Tickers) %>%
+  transmute(Asset = as.character(Tickers), Description, Class, Region, Source,
+            Start, Years)
+
+Tab_Desc <-
+  Monthly %>%
+  group_by(Asset = Tickers) %>%
+  summarise(`Return (ann.)` = prod(1 + Returns)^(12 / n()) - 1,
+            `SD (ann.)`     = sd(Returns) * sqrt(12),
+            `Return / risk` = `Return (ann.)` / `SD (ann.)`,
+            `Max drawdown`  = { cp <- cumprod(1 + Returns); max(1 - cp / cummax(cp)) },
+            Skewness        = PerformanceAnalytics::skewness(Returns),
+            `Excess kurtosis` = PerformanceAnalytics::kurtosis(Returns, method = "excess")) %>%
+  mutate(Asset = factor(Asset, levels = Asset_Info$Tickers)) %>%
+  arrange(Asset) %>% mutate(Asset = as.character(Asset))
+
+# Bond proxy check: calendar-year returns
+Tab_Bond <-
+  Bond_M %>%
+  mutate(Year = year(date)) %>%
+  filter(Year %in% c(2011, 2013, 2014, 2019, 2020, 2021, 2022, 2023)) %>%
+  group_by(Tickers, Year) %>%
+  summarise(Ret = prod(1 + Returns) - 1, .groups = "drop") %>%
+  pivot_wider(names_from = Tickers, values_from = Ret) %>%
+  mutate(Year = as.character(Year))
+
+g_riskret <-
+  Tab_Desc %>% left_join(Asset_Info, by = c("Asset" = "Tickers")) %>%
+  ggplot(aes(`SD (ann.)`, `Return (ann.)`, color = Class)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = Asset), vjust = -1, size = 3, show.legend = FALSE) +
+  labs(title = "Risk and return of the candidate assets",
+       subtitle = "Monthly data from 2010 (local equity from 2015, factor indexes from 2017/18)",
+       x = "Annualised SD", y = "Annualised return",
+       caption = "Note:\nGlobal assets in USD, local assets in ZAR. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+
+Cor_Mat <-
+  Monthly %>% select(date, Tickers, Returns) %>%
+  pivot_wider(names_from = Tickers, values_from = Returns) %>%
+  na.omit() %>% select(-date) %>% cor()
+
+g_cor <-
+  Cor_Mat %>% as_tibble(rownames = "A") %>%
+  pivot_longer(-A, names_to = "B", values_to = "Cor") %>%
+  mutate(A = factor(A, levels = Asset_Info$Tickers),
+         B = factor(B, levels = rev(Asset_Info$Tickers))) %>%
+  ggplot(aes(A, B, fill = Cor)) +
+  geom_tile() +
+  geom_text(aes(label = round(Cor, 2)), size = 2.2) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "darkred",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Correlation of monthly returns",
+       subtitle = "Common sample (all assets available)", x = "", y = "",
+       caption = "Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Table \ref{tab:assets} lists the 15 candidate assets. The paper refers to a multi-asset file (MAA) that is not in the data folder, so the universe is built from the files listed in the question:
+
+- **Global equity:** four non-overlapping MSCI regions (USA, Europe, Japan, Emerging Markets). Overlapping aggregates such as MSCI World are left out because they would make the covariance matrix nearly singular.
+- **Local equity:** the Large and Mid cap indexes, plus two factor indexes, Momentum and Value. The Low Volatility index starts only in 2024, so the five-year rule excludes it.
+- **Local listed property** (J253).
+- **Bonds:** US and Euro 10-year bond proxies built from yields, the All Bond Index (ALBI) and inflation-linked bonds (CILI).
+- **Commodities:** the Bloomberg Commodity index and gold. Brent crude is excluded because the series is a futures price, not an investable total return.
+
+```{r tab-assets, results='asis'}
+tab_print(Tab_Assets, caption = "Candidate assets (all series end in September 2026)", label = "tab:assets",
+          digits = 1, size = "\\scriptsize")
+```
+
+Three data issues matter.
+
+- **Bond returns.** The bond series are yields, so a total-return proxy is built (Section \ref{Method}). Table \ref{tab:bond} shows it behaves as expected. For example, the US proxy lost 16.5% in 2022 when yields surged and gained 10.6% in 2020 when they collapsed, close to actual US Treasury returns.
+- **Currency.** Global assets are in US dollars and local assets in rand. The data folder contains no exchange rate, so returns cannot be converted to a single currency. For a South African investor, rand weakness would add to global returns and raise their volatility.
+- **Property.** Listed property is classified as equity. It behaves like equity (a 63% maximum drawdown and correlations of 0.5–0.8 with equities), and treating it as a yield asset would let it escape the equity cap.
+
+```{r tab-bond, results='asis'}
+tab_print(Tab_Bond, caption = "Bond total-return proxy: calendar-year returns",
+          label = "tab:bond")
+```
+
+Table \ref{tab:desc} and Figure \ref{Figure1} summarise the assets' risk and return.
+
+- **Local bonds offered the best return per unit of risk** since 2010 (ALBI and CILI, both about 1.26).
+- **US equity was the strongest equity market** (14.3% a year).
+- **Global bonds returned little** (1–2% a year), and **broad commodities returned almost nothing**.
+
+```{r tab-desc, results='asis'}
+tab_print(Tab_Desc, caption = "Descriptive statistics of monthly returns (from 2010, or the asset's start date)",
+          label = "tab:desc", size = "\\scriptsize")
+```
+
+```{r Figure1, fig.cap = "Risk and return of the candidate assets \\label{Figure1}"}
+fmxdat::finplot(g_riskret, x.pct = TRUE, x.pct_acc = 1, y.pct = TRUE, y.pct_acc = 1)
+```
+
+The correlations (Figure \ref{Figure2}) shape what the optimiser can do.
+
+- **Local bonds are not equity diversifiers.** The ALBI correlates 0.52–0.66 with equities, because the rand drives both.
+- **Global bonds are the true diversifiers**, with correlations of only 0.0–0.35 with equities.
+- **The local equity indexes are close to one asset:** SA Large, Momentum and Value correlate 0.90–0.93.
+
+```{r Figure2, fig.cap = "Correlation of monthly returns \\label{Figure2}", fig.height = 5.6}
+fmxdat::finplot(g_cor)
+```
+
+# Methodology \label{Method}
+
+## Bond total-return proxy
+
+At each month-end $t-1$, a 10-year par bond is bought with coupon equal to the yield $y_{t-1}$. At $t$ it is re-priced at the new yield, and one month of coupon is added. With semi-annual coupons, the price of a bond with coupon $c$ at yield $y$ is
+
+$$
+P(y; c) = \sum_{k=1}^{20} \frac{c/2}{(1+y/2)^k} + \frac{1}{(1+y/2)^{20}},
+\qquad
+r_t = P(y_t; y_{t-1}) - 1 + \frac{y_{t-1}}{12}.
+$$
+
+Re-pricing the bond captures both duration and convexity, and remains valid for negative yields.
+
+## Expected returns and covariance
+
+Following the course's portfolio-optimisation practical, expected returns are geometric means, the return each asset actually compounded at:
+
+$$
+\hat{\mu}_i = \Big(\prod_{t=1}^{T}(1+R_{i,t})\Big)^{1/T} - 1.
+$$
+
+The sample covariance matrix is shrunk towards a structured target to reduce estimation error [@ledoit2003; @ledoit2004]:
+
+$$
+\hat{\Sigma}_{LW} = (1-\rho)\,\hat{\Sigma} + \rho\, F,
+$$
+
+where $\rho$ is the estimated optimal shrinkage intensity. $\hat{\Sigma}_{LW}$ is computed with the `covEstimation` function of the `RiskPortfolios` package (type "lw") and made positive definite with `nearPD` from the `Matrix` package.
+
+## Missing returns
+
+Assets that start after 2010 have gaps at the start of the estimation window. As the course practical recommends, gaps are never set to zero, since zero is a valid return and would bias the covariance. Instead, each gap is filled with a random draw from the asset's own kernel density $\hat{f}_i$, which preserves its volatility. A fixed seed makes this reproducible.
+
+The practical's function uses the first asset's density probabilities for every asset; here each asset uses its own density.
+
+## Optimisation with the mandate's constraints
+
+Let $w$ be the vector of weights, and let $\mathbb{1}_E$, $\mathbb{1}_B$, $\mathbb{1}_C$ and $\mathbb{1}_G$ indicate equity, bond, commodity and global assets. The feasible set is
+
+$$
+\mathcal{C} = \Big\{ w : \mathbf{1}'w = 1,\;\; 0 \le w_i \le 0.35,\;\; \mathbb{1}_E'w \le 0.75,\;\; \mathbb{1}_B'w \le 0.25,\;\; \mathbb{1}_C'w \le 0.15,\;\; \mathbb{1}_G'w \le 0.60 \Big\}.
+$$
+
+**Minimum variance:**
+
+$$
+w^{MV} = \arg\min_{w \in \mathcal{C}} \; w'\hat{\Sigma}_{LW}\, w.
+$$
+
+**Maximum Sharpe ratio** [@markowitz1952]: maximising $w'\hat{\mu} / \sqrt{w'\hat{\Sigma}w}$ is not a quadratic programme. Following the course practical, it is rewritten in scaled weights $\hat{w}$:
+
+$$
+\min_{\hat{w}} \; \hat{w}'\hat{\Sigma}_{LW}\,\hat{w}
+\quad \text{s.t.} \quad
+\hat{\mu}'\hat{w} = 1,\;\; \hat{w} \ge 0,\;\;
+\hat{w}_i \le 0.35\,\mathbf{1}'\hat{w},\;\;
+\mathbb{1}_g'\hat{w} \le \text{cap}_g\,\mathbf{1}'\hat{w},
+$$
+
+and then $w = \hat{w}/\mathbf{1}'\hat{w}$. The caps must be written in scaled form, because $\hat{w}$ does not sum to one.
+
+Both problems are solved with `quadprog::solve.QP`, which minimises $\tfrac{1}{2}w'Dw - d'w$ subject to $A'w \ge b$. Upper bounds enter as $-w \ge -\text{cap}$.
+
+`RiskPortfolios::optimalPortfolio`, used in the bonus practical, accepts only per-asset bounds. It cannot impose the group caps, which is why the constraint-matrix approach is needed.
+
+## Rolling estimation and rebalancing
+
+At each quarter-end $\tau$ from December 2019 to June 2026:
+
+- An expanding window of monthly data from January 2010 to $\tau$ is used, so every estimate uses at least 120 months.
+- Only assets with at least 60 months of actual returns are eligible.
+- Weights are computed for both optimisers. If an optimiser fails, the rules-based portfolio is used instead, as in the bonus practical's safe optimiser.
+
+Weights decided at $\tau$ are applied from month $\tau+1$, and then drift with prices until the next rebalance:
+
+$$
+R_{p,t} = \sum_i w^{BOP}_{i,t}\, R_{i,t}.
+$$
+
+This timing matters. `Safe_Return.portfolio` with `lag_weights = TRUE` applies weights dated $t$ to month $t$'s return. Dating weights at the decision month would therefore let each portfolio earn a return that was already in its estimation window, a look-ahead bias. Weights are therefore dated at the first month they are held.
+
+## Benchmark, turnover and drift
+
+The **rules-based portfolio** holds fixed buckets, with equal weights within each bucket:
+
+- 30% global equity;
+- 30% local equity;
+- 12.5% local bonds;
+- 12.5% global bonds;
+- 15% commodities.
+
+This puts 57.5% offshore, within the 60% cap.
+
+**Turnover** at each rebalance is
+
+$$
+TO_\tau = \tfrac{1}{2}\sum_i \big|w^{\text{target}}_{i,\tau} - w^{\text{drift}}_{i,\tau}\big|.
+$$
+
+Drifted weights are checked against the caps every month.
+
+# Results \label{Results}
+
+## Optimised weights and binding constraints
+
+```{r optimiser, include=FALSE}
+# -------------------------------------------------------------------
+# Wide return matrix and mandate settings
+# -------------------------------------------------------------------
+return_mat <-
+  Monthly %>% select(date, Tickers, Returns) %>%
+  pivot_wider(names_from = Tickers, values_from = Returns) %>%
+  arrange(date)
+
+Mandate <- list(UB_single = 0.35, Equity = 0.75, Bond = 0.25,
+                Commodity = 0.15, Global = 0.60)
+Min_History  <- 60    # "no assets with < 5 years' returns data"
+Min_LookBack <- 120   # "look-back of at least 10 years"
+
+# -------------------------------------------------------------------
+# Missing returns (adapted from Practical 3: Drawn_Distribution_Own).
+# Each asset's gaps are drawn from its OWN kernel density (the practical's
+# `.$Dens[[1]]` uses the first asset's probabilities for all assets).
+# -------------------------------------------------------------------
+impute_own <- function(return_mat, seed = 13) {
+  set.seed(seed)
+  return_mat %>%
+    pivot_longer(-date, names_to = "Tickers", values_to = "Returns") %>%
+    group_by(Tickers) %>%
+    mutate(Returns = {
+      d <- density(Returns, na.rm = TRUE)
+      draws <- sample(d$x, n(), replace = TRUE, prob = d$y)
+      coalesce(Returns, draws)
+    }) %>%
+    ungroup() %>%
+    pivot_wider(names_from = Tickers, values_from = Returns)
+}
+
+# -------------------------------------------------------------------
+# Constraint matrix (Practical 3: Amat' w >= bvec, first meq equalities)
+# -------------------------------------------------------------------
+Group_Ind <- function(tickers, col, value) {
+  as.numeric(Asset_Info[[col]][match(tickers, Asset_Info$Tickers)] == value)
+}
+
+Build_Constraints <- function(tickers) {
+  N <- length(tickers)
+  Eq <- Group_Ind(tickers, "Class", "Equity")
+  Bd <- Group_Ind(tickers, "Class", "Bond")
+  Cm <- Group_Ind(tickers, "Class", "Commodity")
+  Gl <- Group_Ind(tickers, "Region", "Global")
+
+  Amat <- cbind(1,              # sum(w) = 1            (equality)
+                diag(N),        # w_i >= 0              (long only)
+                -diag(N),       # w_i <= 35%
+                -Eq, -Bd, -Cm, -Gl)   # group caps (as -sum >= -cap)
+  bvec <- c(1, rep(0, N), -rep(Mandate$UB_single, N),
+            -Mandate$Equity, -Mandate$Bond, -Mandate$Commodity, -Mandate$Global)
+  list(Amat = Amat, bvec = bvec, meq = 1, Groups = cbind(Eq, Bd, Cm, Gl))
+}
+
+# (a) Minimum variance: min w' Sigma w (dvec = 0)
+Opt_MinVol <- function(mu, Sigma, Cons) {
+  quadprog::solve.QP(Dmat = Sigma, dvec = rep(0, ncol(Sigma)),
+                     Amat = Cons$Amat, bvec = Cons$bvec, meq = Cons$meq)$solution
+}
+
+# (b) Maximum Sharpe (Practical 3, MSRP) with caps in scaled form
+Opt_MaxSharpe <- function(mu, Sigma, Cons) {
+  N <- ncol(Sigma); G <- Cons$Groups
+  caps <- c(Mandate$Equity, Mandate$Bond, Mandate$Commodity, Mandate$Global)
+  Amat <- cbind(mu,                                   # mu' w_ = 1 (equality)
+                diag(N),                              # w_ >= 0
+                Mandate$UB_single * matrix(1, N, N) - diag(N),
+                sapply(1:4, function(j) caps[j] * rep(1, N) - G[, j]))
+  bvec <- c(1, rep(0, N), rep(0, N), rep(0, 4))
+  w_ <- quadprog::solve.QP(Dmat = Sigma, dvec = rep(0, N),
+                           Amat = Amat, bvec = bvec, meq = 1)$solution
+  w_ / sum(w_)
+}
+
+# (c) Rules-based balanced portfolio (also the fallback, Bonus 3 style)
+Static_Balanced <- function(tickers) {
+  info <- Asset_Info[match(tickers, Asset_Info$Tickers), ]
+  bucket <- paste(info$Region, info$Class)
+  budget <- c("Global Equity" = 0.30, "Local Equity" = 0.30,
+              "Local Bond" = 0.125, "Global Bond" = 0.125,
+              "Global Commodity" = 0.15)
+  as.numeric(budget[bucket] / table(bucket)[bucket])
+}
+
+# Safe wrapper (Bonus 3: purrr::safely, fall back if no convergence)
+optim_foo <- function(Type, mu, Sigma, Cons, tickers) {
+  f <- switch(Type, MinVol = Opt_MinVol, MaxSharpe = Opt_MaxSharpe)
+  res <- purrr::safely(f)(mu, Sigma, Cons)
+  if (is.null(res$error)) {
+    w <- pmax(res$result, 0); w <- w / sum(w)      # clean tiny negatives
+    Result <- "Converged"
+  } else {
+    w <- Static_Balanced(tickers); Result <- "Failed: static fallback"
+  }
+  tibble(Tickers = tickers, Weight = w, Portfolio = Type, Result = Result)
+}
+
+# -------------------------------------------------------------------
+# Rolling optimiser (Bonus 3: Roll_optimizer + map_df)
+# Expanding window from Jan 2010 (>= 120 months), quarterly rebalancing.
+# -------------------------------------------------------------------
+Roll_optimizer <- function(return_mat, Rebal_Date) {
+
+  window <- return_mat %>% filter(date <= Rebal_Date)
+  if (nrow(window) < Min_LookBack) return(NULL)
+
+  # 5-year rule: only assets with >= 60 months of ACTUAL data by this date
+  eligible <- names(window)[-1][colSums(!is.na(window[, -1])) >= Min_History]
+  window <- window %>% select(date, all_of(eligible)) %>% impute_own()
+
+  R <- data.matrix(window[, -1])
+  Sigma <- RiskPortfolios::covEstimation(R, control = list(type = "lw"))
+  Sigma <- as.matrix(Matrix::nearPD(Sigma)$mat)
+  mu <- window %>% summarise(across(-date, ~prod(1 + .)^(1 / n()) - 1)) %>%
+    purrr::as_vector()
+  mu <- mu[colnames(Sigma)]                      # same order (Practical 3)
+  tickers <- colnames(Sigma)
+  Cons <- Build_Constraints(tickers)
+
+  bind_rows(
+    optim_foo("MinVol",    mu, Sigma, Cons, tickers),
+    optim_foo("MaxSharpe", mu, Sigma, Cons, tickers),
+    tibble(Tickers = tickers, Weight = Static_Balanced(tickers),
+           Portfolio = "Static_Balanced", Result = "Rules-based")
+  ) %>%
+    mutate(date = Rebal_Date, LookBack_Months = nrow(window))
+}
+
+Rebal_Dates <-
+  return_mat %>% filter(month(date) %in% c(3, 6, 9, 12),
+                        date >= ymd(20191231), date < max(date)) %>%
+  pull(date)
+
+Weights <- Rebal_Dates %>% map_df(~Roll_optimizer(return_mat, .))
+
+Convergence <- Weights %>% distinct(date, Portfolio, Result) %>% count(Portfolio, Result)
+
+# -------------------------------------------------------------------
+# Verification: every rebalance must satisfy every constraint
+# -------------------------------------------------------------------
+Checks <-
+  Weights %>%
+  left_join(Asset_Info, by = "Tickers") %>%
+  group_by(Portfolio, date) %>%
+  summarise(Sum    = sum(Weight),
+            Min_W  = min(Weight),
+            Max_W  = max(Weight),
+            Equity = sum(Weight[Class == "Equity"]),
+            Bond   = sum(Weight[Class == "Bond"]),
+            Commod = sum(Weight[Class == "Commodity"]),
+            Global = sum(Weight[Region == "Global"]),
+            .groups = "drop")
+
+tol <- 1e-6
+Tab_Checks <-
+  Checks %>%
+  group_by(Portfolio) %>%
+  summarise(Rebalances   = n(),
+            `Sum 1`      = all(abs(Sum - 1) < tol),
+            `Long only`  = all(Min_W > -tol),
+            `Single`     = all(Max_W  <= 0.35 + tol),
+            `Equity`     = all(Equity <= 0.75 + tol),
+            `Bonds`      = all(Bond   <= 0.25 + tol),
+            `Commod.`    = all(Commod <= 0.15 + tol),
+            `Global`     = all(Global <= 0.60 + tol)) %>%
+  mutate(across(where(is.logical), ~ifelse(., "Yes", "No")))
+
+Tab_Exposure <-
+  Checks %>%
+  group_by(Portfolio) %>%
+  summarise(Equity = mean(Equity), Bonds = mean(Bond), Commodities = mean(Commod),
+            Global = mean(Global), `Largest single asset` = mean(Max_W))
+
+Tab_Latest <-
+  Weights %>% filter(date == max(date)) %>%
+  select(Tickers, Portfolio, Weight) %>%
+  pivot_wider(names_from = Portfolio, values_from = Weight) %>%
+  left_join(Asset_Info, by = "Tickers") %>%
+  mutate(Tickers = factor(Tickers, levels = Asset_Info$Tickers)) %>%
+  arrange(Tickers) %>%
+  transmute(Asset = as.character(Tickers), Class, Region, MinVol, MaxSharpe, Static_Balanced)
+
+g_weights <-
+  Weights %>%
+  filter(Portfolio != "Static_Balanced") %>%
+  ggplot() +
+  geom_col(aes(date, Weight, fill = Tickers), width = 80) +
+  facet_wrap(~Portfolio, ncol = 1) +
+  labs(title = "Optimised weights at each quarterly rebalance",
+       subtitle = "Expanding window from 2010 (>= 10 years), Ledoit-Wolf covariance",
+       x = "", y = "Weight",
+       caption = "Note:\nCaps: single asset 35%, equity 75%, bonds 25%, commodities 15%, global 60%. Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  scale_fill_manual(values = c(RColorBrewer::brewer.pal(12, "Paired"),
+                               "grey40", "black", "pink"))
+```
+
+Both optimisers converged at all 27 quarterly rebalances (December 2019 to June 2026), and every portfolio satisfies every constraint at every rebalance (Table \ref{tab:checks}).
+
+```{r tab-checks, results='asis'}
+tab_print(Tab_Checks, caption = "Constraint checks at every rebalance (weights sum to 1; long only; single asset, equity, bond, commodity and global caps of 35\\%, 75\\%, 25\\%, 15\\% and 60\\%)", label = "tab:checks",
+          digits = 0, size = "\\scriptsize")
+```
+
+Table \ref{tab:exposure} shows which constraints bind.
+
+- **The bond and commodity caps force equity to at least 60%.** Bonds ($\le 25\%$) and commodities ($\le 15\%$) leave at least 60% for equity, so the 75% equity cap never binds.
+- **The minimum-variance portfolio fills the bond cap and the 60% global cap.** Global bonds and Japanese equity are its main low-risk building blocks.
+- **The maximum-Sharpe portfolio concentrates on the assets with the best past returns.** MSCI USA reaches the 35% single-asset cap, alongside local inflation-linked bonds, gold and, later, the Value index.
+
+```{r tab-exposure, results='asis'}
+tab_print(Tab_Exposure, caption = "Average exposures across rebalances", label = "tab:exposure")
+```
+
+Figure \ref{Figure3} shows that the maximum-Sharpe weights swing much more from quarter to quarter than the minimum-variance weights. This instability is typical of optimisers that rely on estimated mean returns, which are measured far less precisely than covariances. Table \ref{tab:latest} gives the latest weights.
+
+```{r Figure3, fig.cap = "Optimised weights at each quarterly rebalance \\label{Figure3}", fig.height = 6}
+fmxdat::finplot(g_weights, x.date.dist = "1 year", x.date.type = "%Y",
+                y.pct = TRUE, y.pct_acc = 1)
+```
+
+```{r tab-latest, results='asis'}
+tab_print(Tab_Latest, caption = "Weights at the latest rebalance (June 2026)",
+          label = "tab:latest", size = "\\scriptsize")
+```
+
+## Out-of-sample performance
+
+```{r backtest, include=FALSE}
+# -------------------------------------------------------------------
+# Backtest (Practicals 1 / 2: Safe_Return.portfolio, verbose = TRUE)
+# TIMING: weights DECIDED at quarter-end t can only EARN from t+1.
+# Safe_Return.portfolio(lag_weights = TRUE) applies weights dated t to the
+# return OF month t (checked on a toy example), so each weight set is
+# dated at the first month it is held (Hold_Date).
+# -------------------------------------------------------------------
+Weights_BT <- Weights %>%
+  mutate(Hold_Date = ceiling_date(date + days(1), "month") - days(1))
+
+R_xts <- Monthly %>% filter(date > min(Weights_BT$date)) %>%
+  tbl_xts(cols_to_xts = Returns, spread_by = Tickers)
+
+Port_Builder <- function(Port) {
+
+  # every asset gets a weight on every rebalance date (0 if not eligible)
+  W_xts <- Weights_BT %>% filter(Portfolio == Port) %>%
+    select(date = Hold_Date, Tickers, Weight) %>%
+    complete(date, Tickers = names(R_xts), fill = list(Weight = 0)) %>%
+    tbl_xts(cols_to_xts = Weight, spread_by = Tickers)
+
+  R_use <- R_xts[, names(W_xts)]
+  R_use[is.na(R_use)] <- 0   # only ever where the weight is 0
+
+  out <- rmsfuns::Safe_Return.portfolio(R = R_use, weights = W_xts,
+                                        lag_weights = TRUE, geometric = TRUE,
+                                        verbose = TRUE)
+  list(Returns = out$returns %>% xts_tbl() %>%
+         rename(Ret = portfolio.returns) %>% mutate(Tickers = Port),
+       BOP = out$BOP.Weight %>% xts_tbl() %>%
+         pivot_longer(-date, names_to = "Tickers", values_to = "Weight") %>%
+         mutate(Portfolio = Port),
+       EOP = out$EOP.Weight %>% xts_tbl() %>%
+         pivot_longer(-date, names_to = "Tickers", values_to = "Weight") %>%
+         mutate(Portfolio = Port))
+}
+
+Ports <- c("MinVol", "MaxSharpe", "Static_Balanced")
+Results <- map(Ports, Port_Builder) %>% set_names(Ports)
+Port_Rets <- map_df(Results, "Returns")
+
+g_cum <-
+  Port_Rets %>%
+  group_by(Tickers) %>% arrange(date) %>%
+  mutate(Cum = cumprod(1 + Ret)) %>% ungroup() %>%
+  ggplot() +
+  geom_line(aes(date, Cum, color = Tickers), linewidth = 1.1) +
+  labs(title = "Out-of-sample growth of 1",
+       subtitle = "Quarterly rebalanced from Jan 2020; weights drift between rebalances",
+       x = "", y = "Cumulative return",
+       caption = "Note:\nGlobal assets in USD, local assets in ZAR (no exchange rate in the data). Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) +
+  fmxdat::fmx_cols()
+
+# Statistics table (Bonus 12 style), benchmark = Static_Balanced
+Fundxts <- Port_Rets %>% tbl_xts(cols_to_xts = Ret, spread_by = Tickers,
+                                 Colnames_Exact = TRUE)
+BMxts   <- Port_Rets %>% filter(Tickers == "Static_Balanced") %>%
+  tbl_xts(cols_to_xts = Ret, Colnames_Exact = TRUE)
+
+one_row <- function(x) {
+  x <- as.matrix(x); if (nrow(x) > 1) x <- t(x)
+  out <- data.frame(x); colnames(out) <- colnames(Fundxts); out
+}
+
+Tab_stats <-
+  bind_rows(
+    one_row(Return.cumulative(Fundxts)),
+    one_row(Return.annualized(Fundxts, scale = 12, geometric = TRUE)),
+    one_row(sd.annualized(Fundxts, scale = 12, geometric = TRUE)),
+    one_row(SharpeRatio.annualized(Fundxts, Rf = 0, scale = 12)),
+    one_row(AdjustedSharpeRatio(Fundxts)),
+    one_row(maxDrawdown(Fundxts)),
+    one_row(PainIndex(Fundxts, scale = 12, geometric = TRUE)),
+    one_row(fmxdat::Safe_TE(Ra = Fundxts, Rb = BMxts, scale = 12)),
+    one_row(CVaR(R = Fundxts, p = 0.95, method = "modified"))
+  ) %>%
+  mutate(Info = c("Cumulative return", "Return (ann.)", "SD (ann.)",
+                  "Return / risk", "Adj. Sharpe ratio", "Max drawdown",
+                  "Pain index", "Tracking error vs Static",
+                  "Modified CVaR (95%, monthly)")) %>%
+  relocate(Info) %>% as_tibble() %>%
+  select(Info, MinVol, MaxSharpe, Static_Balanced)
+
+Tab_Cal <-
+  Port_Rets %>% mutate(Year = year(date)) %>%
+  group_by(Tickers, Year) %>% summarise(Ret = prod(1 + Ret) - 1, .groups = "drop") %>%
+  pivot_wider(names_from = Tickers, values_from = Ret) %>%
+  mutate(Year = ifelse(Year == 2026, "2026 (to Sep)", as.character(Year))) %>%
+  select(Year, MinVol, MaxSharpe, Static_Balanced)
+
+g_dd <-
+  Drawdowns(Fundxts) %>% xts_tbl() %>%
+  pivot_longer(-date, names_to = "Tickers", values_to = "DD") %>%
+  ggplot() +
+  geom_line(aes(date, DD, color = Tickers), linewidth = 1) +
+  labs(title = "Drawdowns", x = "", y = "Drawdown",
+       caption = "Source: own calculations.") +
+  fmxdat::theme_fmx(CustomCaption = TRUE) + fmxdat::fmx_cols()
+
+# -------------------------------------------------------------------
+# Turnover: 0.5 * sum |target - drifted|, drifted = EOP weight of the
+# rebalance month (first rebalance has no prior holdings)
+# -------------------------------------------------------------------
+EOP <- map_df(Results, "EOP")
+Turnover <-
+  Weights %>% select(date, Tickers, Portfolio, Target = Weight) %>%
+  left_join(EOP %>% rename(Drifted = Weight), by = c("date", "Tickers", "Portfolio")) %>%
+  filter(!is.na(Drifted)) %>%
+  group_by(Portfolio, date) %>%
+  summarise(Turnover = 0.5 * sum(abs(Target - Drifted)), .groups = "drop")
+
+# -------------------------------------------------------------------
+# Do drifted weights breach the mandate between rebalances?
+# -------------------------------------------------------------------
+BOP <- map_df(Results, "BOP") %>% left_join(Asset_Info, by = "Tickers")
+Drift <-
+  BOP %>% group_by(Portfolio, date) %>%
+  summarise(Max_W  = max(Weight),
+            Equity = sum(Weight[Class == "Equity"]),
+            Bond   = sum(Weight[Class == "Bond"]),
+            Commod = sum(Weight[Class == "Commodity"]),
+            Global = sum(Weight[Region == "Global"]), .groups = "drop")
+
+Tab_Trade <-
+  Turnover %>% group_by(Portfolio) %>%
+  summarise(`Turnover p.a.` = 4 * mean(Turnover)) %>%
+  left_join(
+    Drift %>% group_by(Portfolio) %>%
+      # max() first: inside summarise a new column named Global would
+      # otherwise replace the original Global weights for later lines
+      summarise(`Max bond`   = max(Bond),
+                `Max global` = max(Global),
+                Bonds   = sum(Bond   > 0.25 + 1e-6),
+                Commod. = sum(Commod > 0.15 + 1e-6),
+                Global  = sum(Global > 0.60 + 1e-6),
+                Single  = sum(Max_W  > 0.35 + 1e-6)) %>%
+      relocate(`Max bond`, `Max global`, .after = Single),
+    by = "Portfolio")
+```
+
+Table \ref{tab:stats} and Figure \ref{Figure4} compare the three portfolios out of sample, from January 2020 to September 2026.
+
+- **The optimisers do not clearly beat the simple rules-based portfolio.**
+  - The **minimum-variance** portfolio delivered the smallest drawdown (16.4%) and the smallest tail loss, but its volatility was barely lower (11.2% against 11.4%) and it returned 1.3% a year less.
+  - The **maximum-Sharpe** portfolio earned about 1.2% a year more than the rules-based portfolio, at the cost of a larger drawdown (20.5%).
+- **This echoes a well-known finding:** optimisers built on estimated inputs often struggle to beat simple diversified rules out of sample [@demiguel2009].
+
+```{r tab-stats, results='asis'}
+tab_print(Tab_stats, caption = "Out-of-sample performance, Jan 2020 to Sep 2026 (monthly returns)",
+          label = "tab:stats")
+```
+
+```{r Figure4, fig.cap = "Out-of-sample growth of 1 \\label{Figure4}"}
+fmxdat::finplot(g_cum, x.date.dist = "1 year", x.date.type = "%Y", x.vert = TRUE)
+```
+
+A first version of the backtest gave much better results for the optimisers. For example, the minimum-variance portfolio's volatility was 10.4% and the maximum-Sharpe return 12.8% a year. That version applied each quarter's weights to the return of the month in which they were estimated. Correcting this look-ahead bias (Section \ref{Method}) removed most of the optimisers' apparent advantage, which shows how easily backtests can overstate the value of optimisation.
+
+Calendar-year returns (Table \ref{tab:cal}) and drawdowns (Figure \ref{Figure5}) show that **2022 was the hardest year for all three portfolios ($-6\%$ to $-7\%$)**. Equities and bonds fell together, so the bond allocation offered no protection. The maximum-Sharpe portfolio led in the strong equity years of 2023–2024.
+
+```{r tab-cal, results='asis'}
+tab_print(Tab_Cal, caption = "Calendar-year returns", label = "tab:cal")
+```
+
+```{r Figure5, fig.cap = "Drawdowns \\label{Figure5}"}
+fmxdat::finplot(g_dd, x.date.dist = "1 year", x.date.type = "%Y",
+                x.vert = TRUE, y.pct = TRUE, y.pct_acc = 1)
+```
+
+## Turnover and drift
+
+Table \ref{tab:trade} reports implementation costs and drift.
+
+- **The maximum-Sharpe portfolio trades about 70% of the fund each year**, against 54% for minimum variance and 11% for the rules-based portfolio. Trading costs are not modelled, so they would narrow the maximum-Sharpe portfolio's return advantage.
+- **Drift pushes the portfolios past the caps between rebalances.** Because the optimisers sit at the bond, commodity and global limits, price moves take them over between rebalances, for example bonds up to 28% and global exposure up to 63%.
+- **A practical fix** is to optimise to slightly tighter internal limits (for example the caps minus two percentage points), or to rebalance whenever a cap is breached.
+
+```{r tab-trade, results='asis'}
+tab_print(Tab_Trade, caption = "Annual turnover, number of months (of 81) in which drifted weights breach each cap, and the highest drifted bond and global weights",
+          label = "tab:trade", size = "\\scriptsize")
+```
+
+# Model summary \label{Summary}
+
+```{r tab-summary, results='asis'}
+Summary_Tab <- tibble(
+  ` ` = c("Objective", "Inputs used", "Binding constraints", "Weight stability",
+          "Out-of-sample return / risk", "Drawdown and tail risk", "Turnover", "Verdict"),
+  `Minimum variance` = c("Lowest variance", "Covariance only", "Bonds 25%, global 60%, commodities",
+                         "Fairly stable", "8.8% / 11.2%", "Smallest (16.4%)", "About 54% a year",
+                         "Recommended core strategy"),
+  `Maximum Sharpe` = c("Best return per unit of risk", "Means and covariance", "Bonds 25%, single asset 35%",
+                       "Unstable", "11.3% / 12.5%", "Largest (20.5%)", "About 70% a year",
+                       "Too reliant on noisy return forecasts"),
+  `Rules-based` = c("Fixed balanced buckets", "None", "Within all caps by design",
+                    "Fixed", "10.1% / 11.4%", "Middle (18.0%)", "About 11% a year",
+                    "Strong, cheap benchmark")
+)
+print(xtable::xtable(Summary_Tab, caption = "Summary of the three portfolios",
+                     label = "tab:summary",
+                     align = c("l", "p{3.0cm}", "p{3.6cm}", "p{3.6cm}", "p{3.6cm}")),
+      include.rownames = FALSE, comment = FALSE, table.placement = "!htbp",
+      caption.placement = "top", size = "\\scriptsize")
+```
+
+Table \ref{tab:summary} summarises the three portfolios. All satisfy the mandate at every rebalance. In practice, the bond and commodity caps (which force at least 60% into equity) and the 60% global cap shape the portfolios more than the equity cap does.
+
+**The minimum-variance portfolio is recommended for a balanced index fund.** It does not depend on return forecasts, its weights are relatively stable, and it delivered the smallest drawdown and tail loss.
+
+- **The rules-based portfolio** is a strong, low-cost alternative and a useful benchmark.
+- **The maximum-Sharpe portfolio** earned more, but its advantage rests on noisy estimates of expected returns, larger drawdowns and much higher turnover.
+
+The main limitations are:
+
+- the mix of currencies (US dollar global assets and rand local assets), with no exchange rate available;
+- the bond index proxies constructed from yields;
+- trading costs that are not modelled;
+- weight drift beyond the caps between quarterly rebalances;
+- the multi-asset file mentioned in the paper, which was not provided.
+
+\newpage
+
+# References {-}
+
+<div id="refs"></div>
